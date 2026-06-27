@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: stockpulse-monitor
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python app.py
+    envVars:
+      - key: TELEGRAM_TOKEN
+        sync: false
+      - key: CHAT_ID
+        sync: false
+      - key: TICKERS
+        value: ARR
+      - key: INTRADAY_PCT
+        value: "1"
+      - key: TARGET_PRICE
+        value: "0"
+      - key: TARGET_DIR
+        value: below
+      - key: DAILY_SUMMARY
+        value: "true"
+      - key: CHECK_INTERVAL
+        value: "300"

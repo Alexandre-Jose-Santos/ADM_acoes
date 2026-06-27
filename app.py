@@ -1,0 +1,157 @@
+import os
+import time
+import threading
+import requests
+from flask import Flask, jsonify
+from datetime import datetime
+import pytz
+
+app = Flask(__name__)
+
+# ─── Config via variáveis de ambiente (Render) ───────────
+TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN', '')
+CHAT_ID        = os.environ.get('CHAT_ID', '')
+TICKERS        = [t.strip() for t in os.environ.get('TICKERS', 'ARR').upper().split(',')]
+INTRADAY_PCT   = float(os.environ.get('INTRADAY_PCT', '1'))
+TARGET_PRICE   = float(os.environ.get('TARGET_PRICE', '0'))
+TARGET_DIR     = os.environ.get('TARGET_DIR', 'below')
+DAILY_SUMMARY  = os.environ.get('DAILY_SUMMARY', 'true').lower() == 'true'
+CHECK_INTERVAL = int(os.environ.get('CHECK_INTERVAL', '300'))
+
+# ─── Estado em memória ───────────────────────────────────
+last_known_price = {}
+target_alerted   = {}
+daily_done       = {}
+
+# ─── Yahoo Finance ───────────────────────────────────────
+def fetch_price(ticker):
+    url = f'https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1m&range=1d'
+    r = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
+    meta = r.json()['chart']['result'][0]['meta']
+    return {
+        'ticker':     ticker,
+        'name':       meta.get('shortName', ticker),
+        'price':      meta['regularMarketPrice'],
+        'open':       meta.get('regularMarketOpen', meta['regularMarketPrice']),
+        'prev_close': meta.get('chartPreviousClose', meta.get('previousClose', 0)),
+        'day_high':   meta.get('regularMarketDayHigh', 0),
+        'day_low':    meta.get('regularMarketDayLow', 0),
+        'state':      meta.get('marketState', 'CLOSED'),
+    }
+
+# ─── Telegram ────────────────────────────────────────────
+def send_telegram(msg):
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        return False
+    r = requests.post(
+        f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage',
+        json={'chat_id': CHAT_ID, 'text': msg, 'parse_mode': 'HTML', 'disable_web_page_preview': True},
+        timeout=10
+    )
+    ok = r.json().get('ok', False)
+    print(f'[TELEGRAM] {"✅ Enviado" if ok else "❌ Erro: " + str(r.json())}')
+    return ok
+
+# ─── Checagem por ticker ─────────────────────────────────
+def check_ticker(ticker):
+    data       = fetch_price(ticker)
+    price      = data['price']
+    prev_close = data['prev_close']
+    pct_day    = ((price - prev_close) / prev_close * 100) if prev_close else 0
+    now_str    = datetime.now().strftime('%d/%m/%Y %H:%M:%S')
+    today      = datetime.now().strftime('%Y-%m-%d')
+
+    print(f'[{ticker}] ${price:.2f} ({pct_day:+.2f}%) | {data["state"]}')
+
+    # ── Opção 1: Queda intraday ───────────────────────────
+    last = last_known_price.get(ticker)
+    if last is not None:
+        drop = ((price - last) / last * 100)
+        if drop <= -INTRADAY_PCT:
+            send_telegram(
+                f'📉 <b>QUEDA INTRADAY — {ticker}</b>\n\n'
+                f'🏷 <b>{data["name"]}</b>\n'
+                f'💵 Preço atual: <b>${price:.2f}</b>\n'
+                f'📌 Último registrado: ${last:.2f}\n'
+                f'📉 Variação: <b>{drop:.2f}%</b>\n'
+                f'📊 Variação no dia: {pct_day:.2f}%\n'
+                f'⏰ {now_str}\n'
+                f'<i>⚠️ Não é recomendação de investimento.</i>'
+            )
+            last_known_price[ticker] = price
+    else:
+        last_known_price[ticker] = price
+
+    # ── Opção 2: Faixa de preço alvo ─────────────────────
+    if TARGET_PRICE > 0:
+        crossed = price < TARGET_PRICE if TARGET_DIR == 'below' else price > TARGET_PRICE
+        key = f'{ticker}_{TARGET_DIR}_{TARGET_PRICE}'
+        if crossed and not target_alerted.get(key):
+            target_alerted[key] = True
+            dir_label = 'caiu abaixo de' if TARGET_DIR == 'below' else 'subiu acima de'
+            send_telegram(
+                f'{"📉" if TARGET_DIR == "below" else "📈"} <b>ALERTA DE PREÇO ALVO — {ticker}</b>\n\n'
+                f'🏷 <b>{data["name"]}</b>\n'
+                f'💵 Preço atual: <b>${price:.2f}</b>\n'
+                f'🎯 Cruzou o alvo: <b>{dir_label} ${TARGET_PRICE:.2f}</b>\n'
+                f'📊 Variação no dia: {pct_day:.2f}%\n'
+                f'⏰ {now_str}\n'
+                f'<i>⚠️ Não é recomendação de investimento.</i>'
+            )
+        if not crossed and target_alerted.get(key):
+            del target_alerted[key]
+
+    # ── Opção 3: Resumo diário ────────────────────────────
+    if DAILY_SUMMARY:
+        et_now = datetime.now(pytz.timezone('America/New_York'))
+        h, m   = et_now.hour, et_now.minute
+
+        if h == 9 and 30 <= m <= 35 and not daily_done.get(f'{ticker}_open_{today}'):
+            daily_done[f'{ticker}_open_{today}'] = True
+            open_pct = ((data['open'] - prev_close) / prev_close * 100) if prev_close else 0
+            send_telegram(
+                f'🔔 <b>ABERTURA DO PREGÃO — {ticker}</b>\n\n'
+                f'🏷 <b>{data["name"]}</b>\n'
+                f'💵 Abertura: <b>${data["open"]:.2f}</b>\n'
+                f'📌 Fech. anterior: ${prev_close:.2f}\n'
+                f'📊 Variação inicial: {open_pct:.2f}%\n'
+                f'⏰ {now_str} (9h30 ET)\n'
+                f'<i>⚠️ Não é recomendação de investimento.</i>'
+            )
+
+        if h == 16 and 0 <= m <= 5 and not daily_done.get(f'{ticker}_close_{today}'):
+            daily_done[f'{ticker}_close_{today}'] = True
+            send_telegram(
+                f'{"📉" if pct_day < 0 else "📈"} <b>FECHAMENTO DO PREGÃO — {ticker}</b>\n\n'
+                f'🏷 <b>{data["name"]}</b>\n'
+                f'💵 Fechamento: <b>${price:.2f}</b>\n'
+                f'📌 Abertura: ${data["open"]:.2f}\n'
+                f'📊 Variação no dia: <b>{pct_day:.2f}%</b>\n'
+                f'📈 Máxima: ${data["day_high"]:.2f} · 📉 Mínima: ${data["day_low"]:.2f}\n'
+                f'⏰ {now_str} (16h ET)\n'
+                f'<i>⚠️ Não é recomendação de investimento.</i>'
+            )
+
+# ─── Loop principal ───────────────────────────────────────
+def monitor_loop():
+    print(f'[MONITOR] Tickers: {TICKERS} | Intervalo: {CHECK_INTERVAL}s')
+    while True:
+        for ticker in TICKERS:
+            try:
+                check_ticker(ticker)
+            except Exception as e:
+                print(f'[ERRO] {ticker}: {e}')
+        time.sleep(CHECK_INTERVAL)
+
+# ─── Flask (keepalive + status) ───────────────────────────
+@app.route('/')
+def index():
+    return jsonify({'status': 'online', 'tickers': TICKERS, 'precos': last_known_price})
+
+@app.route('/status')
+def status():
+    return jsonify(last_known_price)
+
+if __name__ == '__main__':
+    threading.Thread(target=monitor_loop, daemon=True).start()
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
