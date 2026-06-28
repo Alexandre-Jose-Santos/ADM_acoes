@@ -148,6 +148,10 @@ def monitor_loop():
 def index():
     return jsonify({'status': 'online', 'tickers': TICKERS, 'precos': last_known_price})
 
+@app.route('/ping')
+def ping():
+    return 'ok', 200
+
 @app.route('/status')
 def status():
     return jsonify(last_known_price)
