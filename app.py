@@ -23,20 +23,39 @@ last_known_price = {}
 target_alerted   = {}
 daily_done       = {}
 
-# ─── Yahoo Finance ───────────────────────────────────────
+# ─── Alpha Vantage ───────────────────────────────────────
+ALPHA_KEY = os.environ.get('ALPHA_KEY', '')
+
 def fetch_price(ticker):
-    url = f'https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1m&range=1d'
-    r = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
-    meta = r.json()['chart']['result'][0]['meta']
+    url = f'https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={ticker}&apikey={ALPHA_KEY}'
+    r = requests.get(url, timeout=10)
+    data = r.json()
+    print(f'[ALPHA] Resposta raw: {data}')
+    quote = data.get('Global Quote', {})
+    if not quote or not quote.get('05. price'):
+        raise Exception(f'Sem dados para {ticker}: {data}')
+    price      = float(quote['05. price'])
+    prev_close = float(quote['08. previous close'])
+    open_price = float(quote['02. open'])
+    day_high   = float(quote['03. high'])
+    day_low    = float(quote['04. low'])
+    et_now = datetime.now(pytz.timezone('America/New_York'))
+    h, m = et_now.hour, et_now.minute
+    if (h == 9 and m >= 30) or (10 <= h <= 15) or (h == 16 and m == 0):
+        state = 'REGULAR'
+    elif h < 9 or (h == 9 and m < 30):
+        state = 'PRE'
+    else:
+        state = 'POST'
     return {
         'ticker':     ticker,
-        'name':       meta.get('shortName', ticker),
-        'price':      meta['regularMarketPrice'],
-        'open':       meta.get('regularMarketOpen', meta['regularMarketPrice']),
-        'prev_close': meta.get('chartPreviousClose', meta.get('previousClose', 0)),
-        'day_high':   meta.get('regularMarketDayHigh', 0),
-        'day_low':    meta.get('regularMarketDayLow', 0),
-        'state':      meta.get('marketState', 'CLOSED'),
+        'name':       ticker,
+        'price':      price,
+        'open':       open_price,
+        'prev_close': prev_close,
+        'day_high':   day_high,
+        'day_low':    day_low,
+        'state':      state,
     }
 
 # ─── Telegram ────────────────────────────────────────────
