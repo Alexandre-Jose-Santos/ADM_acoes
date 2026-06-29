@@ -154,12 +154,18 @@ def check_ticker(ticker):
 # ─── Loop principal ───────────────────────────────────────
 def monitor_loop():
     print(f'[MONITOR] Tickers: {TICKERS} | Intervalo: {CHECK_INTERVAL}s')
+    print(f'[MONITOR] ALPHA_KEY configurada: {"SIM" if ALPHA_KEY else "NAO"}')
     while True:
+        print(f'[MONITOR] Iniciando checagem... {datetime.now()}')
         for ticker in TICKERS:
             try:
+                print(f'[MONITOR] Checando {ticker}...')
                 check_ticker(ticker)
             except Exception as e:
+                import traceback
                 print(f'[ERRO] {ticker}: {e}')
+                print(traceback.format_exc())
+        print(f'[MONITOR] Aguardando {CHECK_INTERVAL}s...')
         time.sleep(CHECK_INTERVAL)
 
 # ─── Flask (keepalive + status) ───────────────────────────
