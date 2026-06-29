@@ -28,7 +28,9 @@ ALPHA_KEY = os.environ.get('ALPHA_KEY', '')
 
 def fetch_price(ticker):
     url = f'https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={ticker}&apikey={ALPHA_KEY}'
-    r = requests.get(url, timeout=10)
+    print(f'[ALPHA] Buscando {url[:60]}...')
+    r = requests.get(url, timeout=15, allow_redirects=True)
+    print(f'[ALPHA] Status HTTP: {r.status_code}')
     data = r.json()
     print(f'[ALPHA] Resposta raw: {data}')
     quote = data.get('Global Quote', {})
