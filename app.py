@@ -27,30 +27,28 @@ daily_done       = {}
 TWELVE_KEY = os.environ.get('TWELVE_KEY', '')
 
 def fetch_price(ticker):
-    url = f'https://api.twelvedata.com/price?symbol={ticker}&apikey={TWELVE_KEY}'
-    print(f'[TWELVE] Buscando preço de {ticker}...')
-    r = requests.get(url, timeout=15)
-    print(f'[TWELVE] Status HTTP: {r.status_code}')
+    sess = requests.Session()
+    sess.headers.update({'User-Agent': 'curl/8.0', 'Accept': '*/*'})
+
+    url = f'https://api.twelvedata.com/quote?symbol={ticker}&apikey={TWELVE_KEY}'
+    print(f'[TWELVE] GET {url}', flush=True)
+    try:
+        r = sess.get(url, timeout=(5, 10))
+        print(f'[TWELVE] Status HTTP: {r.status_code}', flush=True)
+    except Exception as e:
+        print(f'[TWELVE] EXCEPTION na requisição: {type(e).__name__}: {e}', flush=True)
+        raise
     data = r.json()
-    print(f'[TWELVE] Resposta: {data}')
-    if 'price' not in data:
-        raise Exception(f'Sem preço para {ticker}: {data}')
-    price = float(data['price'])
+    print(f'[TWELVE] Resposta completa (quote): {data}', flush=True)
 
-    # Buscar dados do dia (open, high, low, prev_close)
-    url2 = f'https://api.twelvedata.com/eod?symbol={ticker}&apikey={TWELVE_KEY}'
-    r2 = requests.get(url2, timeout=15)
-    data2 = r2.json()
-    print(f'[TWELVE] EOD: {data2}')
-    prev_close = float(data2.get('close', price))
+    if 'close' not in data:
+        raise Exception(f'Sem dados para {ticker}: {data}')
 
-    url3 = f'https://api.twelvedata.com/time_series?symbol={ticker}&interval=1day&outputsize=1&apikey={TWELVE_KEY}'
-    r3 = requests.get(url3, timeout=15)
-    data3 = r3.json()
-    today_bar = data3.get('values', [{}])[0] if data3.get('values') else {}
-    open_price = float(today_bar.get('open', price))
-    day_high   = float(today_bar.get('high', price))
-    day_low    = float(today_bar.get('low', price))
+    price      = float(data['close'])
+    open_price = float(data.get('open', price))
+    prev_close = float(data.get('previous_close', price))
+    day_high   = float(data.get('high', price))
+    day_low    = float(data.get('low', price))
 
     et_now = datetime.now(pytz.timezone('America/New_York'))
     h, m = et_now.hour, et_now.minute
