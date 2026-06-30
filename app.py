@@ -167,7 +167,7 @@ def check_ticker(ticker):
 # ─── Loop principal ───────────────────────────────────────
 def monitor_loop():
     print(f'[MONITOR] Tickers: {TICKERS} | Intervalo: {CHECK_INTERVAL}s')
-    print(f'[MONITOR] ALPHA_KEY configurada: {"SIM" if ALPHA_KEY else "NAO"}')
+    print(f'[MONITOR] TWELVE_KEY configurada: {"SIM" if TWELVE_KEY else "NAO"}')
     while True:
         print(f'[MONITOR] Iniciando checagem... {datetime.now()}')
         for ticker in TICKERS:
