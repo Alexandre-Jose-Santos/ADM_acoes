@@ -18,10 +18,19 @@ TARGET_DIR     = os.environ.get('TARGET_DIR', 'below')
 DAILY_SUMMARY  = os.environ.get('DAILY_SUMMARY', 'true').lower() == 'true'
 CHECK_INTERVAL = int(os.environ.get('CHECK_INTERVAL', '300'))
 
+# Melhorias novas
+MARKET_HOURS_ONLY = os.environ.get('MARKET_HOURS_ONLY', 'false').lower() == 'true'  # horário de silêncio
+RECOVERY_ALERT    = os.environ.get('RECOVERY_ALERT', 'false').lower() == 'true'      # alerta de recuperação
+RECOVERY_PCT      = float(os.environ.get('RECOVERY_PCT', '1'))                       # % de alta pra alertar recuperação
+VOLUME_ALERT      = os.environ.get('VOLUME_ALERT', 'false').lower() == 'true'        # alerta de volume anormal
+VOLUME_MULTIPLIER = float(os.environ.get('VOLUME_MULTIPLIER', '2'))                  # quantas vezes acima da média
+
 # ─── Estado em memória ───────────────────────────────────
 last_known_price = {}
+lowest_since_drop = {}  # menor preço registrado desde a última queda — usado pra recuperação
 target_alerted   = {}
 daily_done       = {}
+volume_alerted   = {}   # evita spam de alerta de volume no mesmo dia
 
 # ─── Twelve Data ─────────────────────────────────────────
 TWELVE_KEY = os.environ.get('TWELVE_KEY', '')
@@ -49,6 +58,8 @@ def fetch_price(ticker):
     prev_close = float(data.get('previous_close', price))
     day_high   = float(data.get('high', price))
     day_low    = float(data.get('low', price))
+    volume     = float(data.get('volume', 0))
+    avg_volume = float(data.get('average_volume', 0))
 
     et_now = datetime.now(pytz.timezone('America/New_York'))
     h, m = et_now.hour, et_now.minute
@@ -66,6 +77,8 @@ def fetch_price(ticker):
         'prev_close': prev_close,
         'day_high':   day_high,
         'day_low':    day_low,
+        'volume':     volume,
+        'avg_volume': avg_volume,
         'state':      state,
     }
 
@@ -111,6 +124,47 @@ def check_ticker(ticker):
             last_known_price[ticker] = price
     else:
         last_known_price[ticker] = price
+
+    # ── Melhoria: Alerta de recuperação ───────────────────
+    if RECOVERY_ALERT:
+        lowest = lowest_since_drop.get(ticker)
+        if lowest is None or price < lowest:
+            lowest_since_drop[ticker] = price
+            lowest = price
+        else:
+            recovery = ((price - lowest) / lowest * 100)
+            if recovery >= RECOVERY_PCT:
+                send_telegram(
+                    f'📈 <b>RECUPERAÇÃO — {ticker}</b>\n\n'
+                    f'🏷 <b>{data["name"]}</b>\n'
+                    f'💵 Preço atual: <b>${price:.2f}</b>\n'
+                    f'📌 Mínima recente: ${lowest:.2f}\n'
+                    f'📈 Recuperação: <b>+{recovery:.2f}%</b>\n'
+                    f'📊 Variação no dia: {pct_day:.2f}%\n'
+                    f'⏰ {now_str}\n'
+                    f'<i>⚠️ Não é recomendação de investimento.</i>'
+                )
+                lowest_since_drop[ticker] = price  # reseta a base para próxima recuperação
+
+    # ── Melhoria: Alerta de volume anormal ────────────────
+    if VOLUME_ALERT:
+        volume     = data.get('volume', 0)
+        avg_volume = data.get('avg_volume', 0)
+        vol_key    = f'{ticker}_{today}'
+        if avg_volume > 0 and volume >= avg_volume * VOLUME_MULTIPLIER and not volume_alerted.get(vol_key):
+            volume_alerted[vol_key] = True
+            vol_ratio = volume / avg_volume
+            send_telegram(
+                f'📊 <b>VOLUME ANORMAL — {ticker}</b>\n\n'
+                f'🏷 <b>{data["name"]}</b>\n'
+                f'💵 Preço atual: <b>${price:.2f}</b>\n'
+                f'📦 Volume hoje: <b>{volume:,.0f}</b>\n'
+                f'📌 Média: {avg_volume:,.0f}\n'
+                f'⚡ <b>{vol_ratio:.1f}x acima da média</b>\n'
+                f'📊 Variação no dia: {pct_day:.2f}%\n'
+                f'⏰ {now_str}\n'
+                f'<i>⚠️ Pode indicar movimento forte. Não é recomendação de investimento.</i>'
+            )
 
     # ── Opção 2: Faixa de preço alvo ─────────────────────
     if TARGET_PRICE > 0:
@@ -163,10 +217,27 @@ def check_ticker(ticker):
             )
 
 # ─── Loop principal ───────────────────────────────────────
+def is_market_hours():
+    """Retorna True se está dentro do pregão (9h30-16h ET, dias úteis)."""
+    et_now = datetime.now(pytz.timezone('America/New_York'))
+    if et_now.weekday() >= 5:  # sábado=5, domingo=6
+        return False
+    h, m = et_now.hour, et_now.minute
+    after_open  = (h > 9) or (h == 9 and m >= 30)
+    before_close = (h < 16)
+    return after_open and before_close
+
 def monitor_loop():
     print(f'[MONITOR] Tickers: {TICKERS} | Intervalo: {CHECK_INTERVAL}s')
     print(f'[MONITOR] TWELVE_KEY configurada: {"SIM" if TWELVE_KEY else "NAO"}')
+    print(f'[MONITOR] Horário de silêncio: {"ATIVO (só pregão)" if MARKET_HOURS_ONLY else "INATIVO (24h)"}')
+    print(f'[MONITOR] Alerta de recuperação: {"ATIVO" if RECOVERY_ALERT else "INATIVO"} ({RECOVERY_PCT}%)')
+    print(f'[MONITOR] Alerta de volume: {"ATIVO" if VOLUME_ALERT else "INATIVO"} ({VOLUME_MULTIPLIER}x)')
     while True:
+        if MARKET_HOURS_ONLY and not is_market_hours():
+            print(f'[MONITOR] Fora do horário de pregão — aguardando... {datetime.now()}')
+            time.sleep(CHECK_INTERVAL)
+            continue
         print(f'[MONITOR] Iniciando checagem... {datetime.now()}')
         for ticker in TICKERS:
             try:
