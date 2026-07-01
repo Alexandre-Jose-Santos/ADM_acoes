@@ -13,6 +13,7 @@ TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN', '')
 CHAT_ID        = os.environ.get('CHAT_ID', '')
 TICKERS        = [t.strip() for t in os.environ.get('TICKERS', 'ARR').upper().split(',')]
 INTRADAY_PCT   = float(os.environ.get('INTRADAY_PCT', '1'))
+INTRADAY_UP_PCT = float(os.environ.get('INTRADAY_UP_PCT', '0'))  # 0 = desativado; % de alta desde último registro pra alertar
 TARGET_PRICE   = float(os.environ.get('TARGET_PRICE', '0'))
 TARGET_DIR     = os.environ.get('TARGET_DIR', 'below')
 DAILY_SUMMARY  = os.environ.get('DAILY_SUMMARY', 'true').lower() == 'true'
@@ -117,6 +118,18 @@ def check_ticker(ticker):
                 f'💵 Preço atual: <b>${price:.2f}</b>\n'
                 f'📌 Último registrado: ${last:.2f}\n'
                 f'📉 Variação: <b>{drop:.2f}%</b>\n'
+                f'📊 Variação no dia: {pct_day:.2f}%\n'
+                f'⏰ {now_str}\n'
+                f'<i>⚠️ Não é recomendação de investimento.</i>'
+            )
+            last_known_price[ticker] = price
+        elif INTRADAY_UP_PCT > 0 and drop >= INTRADAY_UP_PCT:
+            send_telegram(
+                f'📈 <b>ALTA INTRADAY — {ticker}</b>\n\n'
+                f'🏷 <b>{data["name"]}</b>\n'
+                f'💵 Preço atual: <b>${price:.2f}</b>\n'
+                f'📌 Último registrado: ${last:.2f}\n'
+                f'📈 Variação: <b>+{drop:.2f}%</b>\n'
                 f'📊 Variação no dia: {pct_day:.2f}%\n'
                 f'⏰ {now_str}\n'
                 f'<i>⚠️ Não é recomendação de investimento.</i>'
