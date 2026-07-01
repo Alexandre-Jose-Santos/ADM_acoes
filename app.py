@@ -107,36 +107,43 @@ def check_ticker(ticker):
 
     print(f'[{ticker}] ${price:.2f} ({pct_day:+.2f}%) | {data["state"]}')
 
-    # ── Opção 1: Queda intraday ───────────────────────────
-    last = last_known_price.get(ticker)
-    if last is not None:
-        drop = ((price - last) / last * 100)
-        if drop <= -INTRADAY_PCT:
+    # ── Opção 1: Queda/Alta acumulada no dia (vs. fechamento anterior) ──
+    # Em vez de comparar com o último preço checado (que "reseta" a base
+    # a cada checagem e mascara quedas graduais), comparamos sempre com
+    # o fechamento do dia anterior e alertamos a cada NÍVEL de X% atingido.
+    if INTRADAY_PCT > 0:
+        level_reached = int(abs(pct_day) // INTRADAY_PCT) if pct_day < 0 else 0
+        alert_key = f'{ticker}_down_{today}_{level_reached}'
+        if level_reached >= 1 and not target_alerted.get(alert_key):
+            # marca todos os níveis anteriores como "vistos" também (evita re-disparo se cair mais e voltar)
+            target_alerted[alert_key] = True
             send_telegram(
-                f'📉 <b>QUEDA INTRADAY — {ticker}</b>\n\n'
+                f'📉 <b>QUEDA NO DIA — {ticker}</b>\n\n'
                 f'🏷 <b>{data["name"]}</b>\n'
                 f'💵 Preço atual: <b>${price:.2f}</b>\n'
-                f'📌 Último registrado: ${last:.2f}\n'
-                f'📉 Variação: <b>{drop:.2f}%</b>\n'
-                f'📊 Variação no dia: {pct_day:.2f}%\n'
+                f'📌 Fechamento anterior: ${prev_close:.2f}\n'
+                f'📉 Variação acumulada: <b>{pct_day:.2f}%</b>\n'
                 f'⏰ {now_str}\n'
                 f'<i>⚠️ Não é recomendação de investimento.</i>'
             )
-            last_known_price[ticker] = price
-        elif INTRADAY_UP_PCT > 0 and drop >= INTRADAY_UP_PCT:
+
+    if INTRADAY_UP_PCT > 0:
+        level_reached_up = int(pct_day // INTRADAY_UP_PCT) if pct_day > 0 else 0
+        alert_key_up = f'{ticker}_up_{today}_{level_reached_up}'
+        if level_reached_up >= 1 and not target_alerted.get(alert_key_up):
+            target_alerted[alert_key_up] = True
             send_telegram(
-                f'📈 <b>ALTA INTRADAY — {ticker}</b>\n\n'
+                f'📈 <b>ALTA NO DIA — {ticker}</b>\n\n'
                 f'🏷 <b>{data["name"]}</b>\n'
                 f'💵 Preço atual: <b>${price:.2f}</b>\n'
-                f'📌 Último registrado: ${last:.2f}\n'
-                f'📈 Variação: <b>+{drop:.2f}%</b>\n'
-                f'📊 Variação no dia: {pct_day:.2f}%\n'
+                f'📌 Fechamento anterior: ${prev_close:.2f}\n'
+                f'📈 Variação acumulada: <b>+{pct_day:.2f}%</b>\n'
                 f'⏰ {now_str}\n'
                 f'<i>⚠️ Não é recomendação de investimento.</i>'
             )
-            last_known_price[ticker] = price
-    else:
-        last_known_price[ticker] = price
+
+    last_known_price[ticker] = price
+
 
     # ── Melhoria: Alerta de recuperação ───────────────────
     if RECOVERY_ALERT:
@@ -231,13 +238,13 @@ def check_ticker(ticker):
 
 # ─── Loop principal ───────────────────────────────────────
 def is_market_hours():
-    """Retorna True se está dentro do pregão (9h30-16h ET, dias úteis)."""
+    """Retorna True se está dentro do pregão + after-hours (9h30-20h ET, dias úteis)."""
     et_now = datetime.now(pytz.timezone('America/New_York'))
     if et_now.weekday() >= 5:  # sábado=5, domingo=6
         return False
     h, m = et_now.hour, et_now.minute
     after_open  = (h > 9) or (h == 9 and m >= 30)
-    before_close = (h < 16)
+    before_close = (h < 20)  # inclui after-hours até 20h ET
     return after_open and before_close
 
 def monitor_loop():
