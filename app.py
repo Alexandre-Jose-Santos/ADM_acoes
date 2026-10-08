@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import threading
 import requests
@@ -11,7 +12,7 @@ app = Flask(__name__)
 # ─── Config via variáveis de ambiente (Render) ───────────
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN', '')
 CHAT_ID        = os.environ.get('CHAT_ID', '')
-TICKERS        = [t.strip() for t in os.environ.get('TICKERS', 'ARR').upper().split(',')]
+TICKERS        = [t.strip() for t in os.environ.get('TICKERS', 'ARR').upper().split(',') if t.strip()]
 INTRADAY_PCT   = float(os.environ.get('INTRADAY_PCT', '1'))
 INTRADAY_UP_PCT = float(os.environ.get('INTRADAY_UP_PCT', '0'))  # 0 = desativado; % de alta desde último registro pra alertar
 TARGET_PRICE   = float(os.environ.get('TARGET_PRICE', '0'))
@@ -26,22 +27,62 @@ RECOVERY_PCT      = float(os.environ.get('RECOVERY_PCT', '1'))                  
 VOLUME_ALERT      = os.environ.get('VOLUME_ALERT', 'false').lower() == 'true'        # alerta de volume anormal
 VOLUME_MULTIPLIER = float(os.environ.get('VOLUME_MULTIPLIER', '2'))                  # quantas vezes acima da média
 
-# ─── Estado em memória ───────────────────────────────────
+# ─── Estado em memória (tudo já separado por ticker) ─────
 last_known_price = {}
 lowest_since_drop = {}  # menor preço registrado desde a última queda — usado pra recuperação
 target_alerted   = {}
 daily_done       = {}
 volume_alerted   = {}   # evita spam de alerta de volume no mesmo dia
 
-# ─── Twelve Data ─────────────────────────────────────────
-TWELVE_KEY = os.environ.get('TWELVE_KEY', '')
+# ─── Chaves das APIs ─────────────────────────────────────
+TWELVE_KEY  = os.environ.get('TWELVE_KEY', '')
+BRAPI_TOKEN = os.environ.get('BRAPI_TOKEN', '')  # opcional (MGLU3 funciona sem token em modo de teste)
 
-def fetch_price(ticker):
+# ─── Mercados ────────────────────────────────────────────
+# Horários em hora local de cada bolsa. CONFIRA os horários da B3 e ajuste se precisar.
+MARKETS = {
+    'US': {'tz': 'America/New_York',  'cur': '$',  'open': (9, 30),  'close': (16, 0)},
+    'B3': {'tz': 'America/Sao_Paulo', 'cur': 'R$ ', 'open': (10, 0), 'close': (17, 55)},
+}
+
+def is_b3(ticker):
+    """Ticker da B3: 4 letras + 1 ou 2 dígitos (MGLU3, PETR4, ITUB4, TAEE11...)."""
+    return re.fullmatch(r'[A-Z]{4}\d{1,2}', ticker) is not None
+
+def market_of(ticker):
+    return MARKETS['B3'] if is_b3(ticker) else MARKETS['US']
+
+def intraday_pct(ticker):
+    """Permite um limite próprio por ação, ex.: variável INTRADAY_PCT_MGLU3=1"""
+    return float(os.environ.get(f'INTRADAY_PCT_{ticker}', INTRADAY_PCT))
+
+def intraday_up_pct(ticker):
+    return float(os.environ.get(f'INTRADAY_UP_PCT_{ticker}', INTRADAY_UP_PCT))
+
+def minutes_now(mkt):
+    now = datetime.now(pytz.timezone(mkt['tz']))
+    return now, now.hour * 60 + now.minute
+
+def session_state(mkt):
+    now, mins = minutes_now(mkt)
+    o = mkt['open'][0] * 60 + mkt['open'][1]
+    c = mkt['close'][0] * 60 + mkt['close'][1]
+    if now.weekday() >= 5:
+        return 'FECHADO'
+    if mins < o:
+        return 'PRE'
+    if mins <= c:
+        return 'REGULAR'
+    return 'POST'
+
+# ─── Busca de preço ──────────────────────────────────────
+def fetch_price_twelve(ticker):
     sess = requests.Session()
     sess.headers.update({'User-Agent': 'curl/8.0', 'Accept': '*/*'})
 
     url = f'https://api.twelvedata.com/quote?symbol={ticker}&apikey={TWELVE_KEY}'
-    print(f'[TWELVE] GET {url}', flush=True)
+    # Não imprime a URL: ela contém a chave da API
+    print(f'[TWELVE] GET quote {ticker}', flush=True)
     try:
         r = sess.get(url, timeout=(5, 10))
         print(f'[TWELVE] Status HTTP: {r.status_code}', flush=True)
@@ -49,7 +90,7 @@ def fetch_price(ticker):
         print(f'[TWELVE] EXCEPTION na requisição: {type(e).__name__}: {e}', flush=True)
         raise
     data = r.json()
-    print(f'[TWELVE] Resposta completa (quote): {data}', flush=True)
+    print(f'[TWELVE] Resposta (quote): {data}', flush=True)
 
     if 'close' not in data:
         raise Exception(f'Sem dados para {ticker}: {data}')
@@ -62,26 +103,54 @@ def fetch_price(ticker):
     volume     = float(data.get('volume', 0))
     avg_volume = float(data.get('average_volume', 0))
 
-    et_now = datetime.now(pytz.timezone('America/New_York'))
-    h, m = et_now.hour, et_now.minute
-    if (h == 9 and m >= 30) or (10 <= h <= 15) or (h == 16 and m == 0):
-        state = 'REGULAR'
-    elif h < 9 or (h == 9 and m < 30):
-        state = 'PRE'
-    else:
-        state = 'POST'
+    return {
+        'ticker': ticker, 'name': ticker, 'price': price, 'open': open_price,
+        'prev_close': prev_close, 'day_high': day_high, 'day_low': day_low,
+        'volume': volume, 'avg_volume': avg_volume,
+    }
+
+def fetch_price_brapi(ticker):
+    headers = {'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json'}
+    if BRAPI_TOKEN:
+        headers['Authorization'] = f'Bearer {BRAPI_TOKEN}'
+
+    url = f'https://brapi.dev/api/quote/{ticker}'
+    print(f'[BRAPI] GET quote {ticker}', flush=True)
+    try:
+        r = requests.get(url, headers=headers, timeout=(5, 10))
+        print(f'[BRAPI] Status HTTP: {r.status_code}', flush=True)
+    except Exception as e:
+        print(f'[BRAPI] EXCEPTION na requisição: {type(e).__name__}: {e}', flush=True)
+        raise
+    data = r.json()
+    results = data.get('results') or []
+    if r.status_code != 200 or not results:
+        raise Exception(f'Sem dados para {ticker} (HTTP {r.status_code}): {data}')
+
+    q = results[0]
+    print(f'[BRAPI] {ticker}: preço={q.get("regularMarketPrice")} '
+          f'tempo={q.get("regularMarketTime")}', flush=True)
+
+    price = float(q['regularMarketPrice'])
     return {
         'ticker':     ticker,
-        'name':       ticker,
+        'name':       q.get('shortName') or q.get('longName') or ticker,
         'price':      price,
-        'open':       open_price,
-        'prev_close': prev_close,
-        'day_high':   day_high,
-        'day_low':    day_low,
-        'volume':     volume,
-        'avg_volume': avg_volume,
-        'state':      state,
+        'open':       float(q.get('regularMarketOpen') or price),
+        'prev_close': float(q.get('regularMarketPreviousClose') or price),
+        'day_high':   float(q.get('regularMarketDayHigh') or price),
+        'day_low':    float(q.get('regularMarketDayLow') or price),
+        'volume':     float(q.get('regularMarketVolume') or 0),
+        'avg_volume': float(q.get('averageDailyVolume3Month') or 0),
     }
+
+def fetch_price(ticker):
+    mkt = market_of(ticker)
+    data = fetch_price_brapi(ticker) if is_b3(ticker) else fetch_price_twelve(ticker)
+    data['state'] = session_state(mkt)
+    data['cur']   = mkt['cur']
+    data['mkt']   = mkt
+    return data
 
 # ─── Telegram ────────────────────────────────────────────
 def send_telegram(msg):
@@ -101,49 +170,49 @@ def check_ticker(ticker):
     data       = fetch_price(ticker)
     price      = data['price']
     prev_close = data['prev_close']
+    cur        = data['cur']
+    mkt        = data['mkt']
     pct_day    = ((price - prev_close) / prev_close * 100) if prev_close else 0
     now_str    = datetime.now().strftime('%d/%m/%Y %H:%M:%S')
     today      = datetime.now().strftime('%Y-%m-%d')
 
-    print(f'[{ticker}] ${price:.2f} ({pct_day:+.2f}%) | {data["state"]}')
+    print(f'[{ticker}] {cur}{price:.2f} ({pct_day:+.2f}%) | {data["state"]}')
 
     # ── Opção 1: Queda/Alta acumulada no dia (vs. fechamento anterior) ──
-    # Em vez de comparar com o último preço checado (que "reseta" a base
-    # a cada checagem e mascara quedas graduais), comparamos sempre com
-    # o fechamento do dia anterior e alertamos a cada NÍVEL de X% atingido.
-    if INTRADAY_PCT > 0:
-        level_reached = int(abs(pct_day) // INTRADAY_PCT) if pct_day < 0 else 0
+    # Alerta a cada NÍVEL de X% atingido, sempre comparando com o fechamento anterior.
+    down_step = intraday_pct(ticker)
+    if down_step > 0:
+        level_reached = int(abs(pct_day) // down_step) if pct_day < 0 else 0
         alert_key = f'{ticker}_down_{today}_{level_reached}'
         if level_reached >= 1 and not target_alerted.get(alert_key):
-            # marca todos os níveis anteriores como "vistos" também (evita re-disparo se cair mais e voltar)
             target_alerted[alert_key] = True
             send_telegram(
                 f'📉 <b>QUEDA NO DIA — {ticker}</b>\n\n'
                 f'🏷 <b>{data["name"]}</b>\n'
-                f'💵 Preço atual: <b>${price:.2f}</b>\n'
-                f'📌 Fechamento anterior: ${prev_close:.2f}\n'
+                f'💵 Preço atual: <b>{cur}{price:.2f}</b>\n'
+                f'📌 Fechamento anterior: {cur}{prev_close:.2f}\n'
                 f'📉 Variação acumulada: <b>{pct_day:.2f}%</b>\n'
                 f'⏰ {now_str}\n'
                 f'<i>⚠️ Não é recomendação de investimento.</i>'
             )
 
-    if INTRADAY_UP_PCT > 0:
-        level_reached_up = int(pct_day // INTRADAY_UP_PCT) if pct_day > 0 else 0
+    up_step = intraday_up_pct(ticker)
+    if up_step > 0:
+        level_reached_up = int(pct_day // up_step) if pct_day > 0 else 0
         alert_key_up = f'{ticker}_up_{today}_{level_reached_up}'
         if level_reached_up >= 1 and not target_alerted.get(alert_key_up):
             target_alerted[alert_key_up] = True
             send_telegram(
                 f'📈 <b>ALTA NO DIA — {ticker}</b>\n\n'
                 f'🏷 <b>{data["name"]}</b>\n'
-                f'💵 Preço atual: <b>${price:.2f}</b>\n'
-                f'📌 Fechamento anterior: ${prev_close:.2f}\n'
+                f'💵 Preço atual: <b>{cur}{price:.2f}</b>\n'
+                f'📌 Fechamento anterior: {cur}{prev_close:.2f}\n'
                 f'📈 Variação acumulada: <b>+{pct_day:.2f}%</b>\n'
                 f'⏰ {now_str}\n'
                 f'<i>⚠️ Não é recomendação de investimento.</i>'
             )
 
     last_known_price[ticker] = price
-
 
     # ── Melhoria: Alerta de recuperação ───────────────────
     if RECOVERY_ALERT:
@@ -157,8 +226,8 @@ def check_ticker(ticker):
                 send_telegram(
                     f'📈 <b>RECUPERAÇÃO — {ticker}</b>\n\n'
                     f'🏷 <b>{data["name"]}</b>\n'
-                    f'💵 Preço atual: <b>${price:.2f}</b>\n'
-                    f'📌 Mínima recente: ${lowest:.2f}\n'
+                    f'💵 Preço atual: <b>{cur}{price:.2f}</b>\n'
+                    f'📌 Mínima recente: {cur}{lowest:.2f}\n'
                     f'📈 Recuperação: <b>+{recovery:.2f}%</b>\n'
                     f'📊 Variação no dia: {pct_day:.2f}%\n'
                     f'⏰ {now_str}\n'
@@ -177,7 +246,7 @@ def check_ticker(ticker):
             send_telegram(
                 f'📊 <b>VOLUME ANORMAL — {ticker}</b>\n\n'
                 f'🏷 <b>{data["name"]}</b>\n'
-                f'💵 Preço atual: <b>${price:.2f}</b>\n'
+                f'💵 Preço atual: <b>{cur}{price:.2f}</b>\n'
                 f'📦 Volume hoje: <b>{volume:,.0f}</b>\n'
                 f'📌 Média: {avg_volume:,.0f}\n'
                 f'⚡ <b>{vol_ratio:.1f}x acima da média</b>\n'
@@ -187,17 +256,22 @@ def check_ticker(ticker):
             )
 
     # ── Opção 2: Faixa de preço alvo ─────────────────────
-    if TARGET_PRICE > 0:
-        crossed = price < TARGET_PRICE if TARGET_DIR == 'below' else price > TARGET_PRICE
-        key = f'{ticker}_{TARGET_DIR}_{TARGET_PRICE}'
+    # Obs.: TARGET_PRICE é um valor único e vale para todos os tickers.
+    # Se for pensado para a ARR (em US$), pode disparar errado na MGLU3 (em R$).
+    # Para alvo próprio: variáveis TARGET_PRICE_MGLU3 e TARGET_DIR_MGLU3.
+    t_price = float(os.environ.get(f'TARGET_PRICE_{ticker}', TARGET_PRICE))
+    t_dir   = os.environ.get(f'TARGET_DIR_{ticker}', TARGET_DIR)
+    if t_price > 0:
+        crossed = price < t_price if t_dir == 'below' else price > t_price
+        key = f'{ticker}_{t_dir}_{t_price}'
         if crossed and not target_alerted.get(key):
             target_alerted[key] = True
-            dir_label = 'caiu abaixo de' if TARGET_DIR == 'below' else 'subiu acima de'
+            dir_label = 'caiu abaixo de' if t_dir == 'below' else 'subiu acima de'
             send_telegram(
-                f'{"📉" if TARGET_DIR == "below" else "📈"} <b>ALERTA DE PREÇO ALVO — {ticker}</b>\n\n'
+                f'{"📉" if t_dir == "below" else "📈"} <b>ALERTA DE PREÇO ALVO — {ticker}</b>\n\n'
                 f'🏷 <b>{data["name"]}</b>\n'
-                f'💵 Preço atual: <b>${price:.2f}</b>\n'
-                f'🎯 Cruzou o alvo: <b>{dir_label} ${TARGET_PRICE:.2f}</b>\n'
+                f'💵 Preço atual: <b>{cur}{price:.2f}</b>\n'
+                f'🎯 Cruzou o alvo: <b>{dir_label} {cur}{t_price:.2f}</b>\n'
                 f'📊 Variação no dia: {pct_day:.2f}%\n'
                 f'⏰ {now_str}\n'
                 f'<i>⚠️ Não é recomendação de investimento.</i>'
@@ -205,61 +279,69 @@ def check_ticker(ticker):
         if not crossed and target_alerted.get(key):
             del target_alerted[key]
 
-    # ── Opção 3: Resumo diário ────────────────────────────
+    # ── Opção 3: Resumo diário (no horário de cada bolsa) ─
     if DAILY_SUMMARY:
-        et_now = datetime.now(pytz.timezone('America/New_York'))
-        h, m   = et_now.hour, et_now.minute
+        local_now, mins = minutes_now(mkt)
+        open_min  = mkt['open'][0] * 60 + mkt['open'][1]
+        close_min = mkt['close'][0] * 60 + mkt['close'][1]
+        open_lbl  = f'{mkt["open"][0]}h{mkt["open"][1]:02d}'
+        close_lbl = f'{mkt["close"][0]}h{mkt["close"][1]:02d}'
 
-        if h == 9 and 30 <= m <= 35 and not daily_done.get(f'{ticker}_open_{today}'):
+        if 0 <= mins - open_min <= 5 and local_now.weekday() < 5 \
+                and not daily_done.get(f'{ticker}_open_{today}'):
             daily_done[f'{ticker}_open_{today}'] = True
             open_pct = ((data['open'] - prev_close) / prev_close * 100) if prev_close else 0
             send_telegram(
                 f'🔔 <b>ABERTURA DO PREGÃO — {ticker}</b>\n\n'
                 f'🏷 <b>{data["name"]}</b>\n'
-                f'💵 Abertura: <b>${data["open"]:.2f}</b>\n'
-                f'📌 Fech. anterior: ${prev_close:.2f}\n'
+                f'💵 Abertura: <b>{cur}{data["open"]:.2f}</b>\n'
+                f'📌 Fech. anterior: {cur}{prev_close:.2f}\n'
                 f'📊 Variação inicial: {open_pct:.2f}%\n'
-                f'⏰ {now_str} (9h30 ET)\n'
+                f'⏰ {now_str} ({open_lbl} local)\n'
                 f'<i>⚠️ Não é recomendação de investimento.</i>'
             )
 
-        if h == 16 and 0 <= m <= 5 and not daily_done.get(f'{ticker}_close_{today}'):
+        if 0 <= mins - close_min <= 5 and local_now.weekday() < 5 \
+                and not daily_done.get(f'{ticker}_close_{today}'):
             daily_done[f'{ticker}_close_{today}'] = True
             send_telegram(
                 f'{"📉" if pct_day < 0 else "📈"} <b>FECHAMENTO DO PREGÃO — {ticker}</b>\n\n'
                 f'🏷 <b>{data["name"]}</b>\n'
-                f'💵 Fechamento: <b>${price:.2f}</b>\n'
-                f'📌 Abertura: ${data["open"]:.2f}\n'
+                f'💵 Fechamento: <b>{cur}{price:.2f}</b>\n'
+                f'📌 Abertura: {cur}{data["open"]:.2f}\n'
                 f'📊 Variação no dia: <b>{pct_day:.2f}%</b>\n'
-                f'📈 Máxima: ${data["day_high"]:.2f} · 📉 Mínima: ${data["day_low"]:.2f}\n'
-                f'⏰ {now_str} (16h ET)\n'
+                f'📈 Máxima: {cur}{data["day_high"]:.2f} · 📉 Mínima: {cur}{data["day_low"]:.2f}\n'
+                f'⏰ {now_str} ({close_lbl} local)\n'
                 f'<i>⚠️ Não é recomendação de investimento.</i>'
             )
 
 # ─── Loop principal ───────────────────────────────────────
-def is_market_hours():
-    """Retorna True se está dentro do pregão + after-hours (9h30-20h ET, dias úteis)."""
-    et_now = datetime.now(pytz.timezone('America/New_York'))
-    if et_now.weekday() >= 5:  # sábado=5, domingo=6
+def is_market_hours(ticker):
+    """True se a bolsa do ticker está em pregão (dias úteis). EUA inclui after-hours até 20h ET."""
+    mkt = market_of(ticker)
+    now, mins = minutes_now(mkt)
+    if now.weekday() >= 5:
         return False
-    h, m = et_now.hour, et_now.minute
-    after_open  = (h > 9) or (h == 9 and m >= 30)
-    before_close = (h < 20)  # inclui after-hours até 20h ET
-    return after_open and before_close
+    open_min = mkt['open'][0] * 60 + mkt['open'][1]
+    if is_b3(ticker):
+        close_min = mkt['close'][0] * 60 + mkt['close'][1]
+    else:
+        close_min = 20 * 60  # inclui after-hours até 20h ET
+    return open_min <= mins <= close_min
 
 def monitor_loop():
     print(f'[MONITOR] Tickers: {TICKERS} | Intervalo: {CHECK_INTERVAL}s')
     print(f'[MONITOR] TWELVE_KEY configurada: {"SIM" if TWELVE_KEY else "NAO"}')
+    print(f'[MONITOR] BRAPI_TOKEN configurado: {"SIM" if BRAPI_TOKEN else "NAO (modo teste)"}')
     print(f'[MONITOR] Horário de silêncio: {"ATIVO (só pregão)" if MARKET_HOURS_ONLY else "INATIVO (24h)"}')
     print(f'[MONITOR] Alerta de recuperação: {"ATIVO" if RECOVERY_ALERT else "INATIVO"} ({RECOVERY_PCT}%)')
     print(f'[MONITOR] Alerta de volume: {"ATIVO" if VOLUME_ALERT else "INATIVO"} ({VOLUME_MULTIPLIER}x)')
     while True:
-        if MARKET_HOURS_ONLY and not is_market_hours():
-            print(f'[MONITOR] Fora do horário de pregão — aguardando... {datetime.now()}')
-            time.sleep(CHECK_INTERVAL)
-            continue
         print(f'[MONITOR] Iniciando checagem... {datetime.now()}')
         for ticker in TICKERS:
+            if MARKET_HOURS_ONLY and not is_market_hours(ticker):
+                print(f'[MONITOR] {ticker}: fora do horário de pregão — pulando')
+                continue
             try:
                 print(f'[MONITOR] Checando {ticker}...')
                 check_ticker(ticker)
