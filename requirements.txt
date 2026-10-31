@@ -1,3 +1,6 @@
 flask
 requests
 pytz
+pyTelegramBotAPI
+psycopg2-binary
+gunicorn
