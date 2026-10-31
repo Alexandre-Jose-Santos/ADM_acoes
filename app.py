@@ -3,57 +3,67 @@ import re
 import time
 import threading
 import requests
-from flask import Flask, jsonify
-from datetime import datetime
+import telebot
+from telebot import types
+from contextlib import contextmanager
+from flask import Flask, jsonify, request
+from datetime import datetime, timedelta
 import pytz
 
 app = Flask(__name__)
 
 # ─── Config via variáveis de ambiente (Render) ───────────
-TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN', '')
-CHAT_ID        = os.environ.get('CHAT_ID', '')
-TICKERS        = [t.strip() for t in os.environ.get('TICKERS', 'ARR').upper().split(',') if t.strip()]
-INTRADAY_PCT   = float(os.environ.get('INTRADAY_PCT', '1'))
-INTRADAY_UP_PCT = float(os.environ.get('INTRADAY_UP_PCT', '0'))  # 0 = desativado; % de alta desde último registro pra alertar
-TARGET_PRICE   = float(os.environ.get('TARGET_PRICE', '0'))
-TARGET_DIR     = os.environ.get('TARGET_DIR', 'below')
-DAILY_SUMMARY  = os.environ.get('DAILY_SUMMARY', 'true').lower() == 'true'
-CHECK_INTERVAL = int(os.environ.get('CHECK_INTERVAL', '300'))
+TELEGRAM_TOKEN  = os.environ.get('TELEGRAM_TOKEN', '')
+CHAT_ID         = os.environ.get('CHAT_ID', '')          # seu chat (dono do bot)
+TICKERS         = [t.strip() for t in os.environ.get('TICKERS', 'ARR').upper().split(',') if t.strip()]
+INTRADAY_PCT    = float(os.environ.get('INTRADAY_PCT', '1'))
+INTRADAY_UP_PCT = float(os.environ.get('INTRADAY_UP_PCT', '0'))
+TARGET_PRICE    = float(os.environ.get('TARGET_PRICE', '0'))   # só vale para o dono
+TARGET_DIR      = os.environ.get('TARGET_DIR', 'below')
+DAILY_SUMMARY   = os.environ.get('DAILY_SUMMARY', 'true').lower() == 'true'
+CHECK_INTERVAL  = int(os.environ.get('CHECK_INTERVAL', '300'))
 
-# Melhorias novas
-MARKET_HOURS_ONLY = os.environ.get('MARKET_HOURS_ONLY', 'false').lower() == 'true'  # horário de silêncio
-RECOVERY_ALERT    = os.environ.get('RECOVERY_ALERT', 'false').lower() == 'true'      # alerta de recuperação
-RECOVERY_PCT      = float(os.environ.get('RECOVERY_PCT', '1'))                       # % de alta pra alertar recuperação
-VOLUME_ALERT      = os.environ.get('VOLUME_ALERT', 'false').lower() == 'true'        # alerta de volume anormal
-VOLUME_MULTIPLIER = float(os.environ.get('VOLUME_MULTIPLIER', '2'))                  # quantas vezes acima da média
+MARKET_HOURS_ONLY = os.environ.get('MARKET_HOURS_ONLY', 'false').lower() == 'true'
+RECOVERY_ALERT    = os.environ.get('RECOVERY_ALERT', 'false').lower() == 'true'
+RECOVERY_PCT      = float(os.environ.get('RECOVERY_PCT', '1'))
+VOLUME_ALERT      = os.environ.get('VOLUME_ALERT', 'false').lower() == 'true'
+VOLUME_MULTIPLIER = float(os.environ.get('VOLUME_MULTIPLIER', '2'))
 
-# ─── Estado em memória (tudo já separado por ticker) ─────
-last_known_price = {}
-lowest_since_drop = {}  # menor preço registrado desde a última queda — usado pra recuperação
-target_alerted   = {}
-daily_done       = {}
-volume_alerted   = {}   # evita spam de alerta de volume no mesmo dia
+# ─── Assinatura / banco / pagamento ──────────────────────
+DATABASE_URL  = os.environ.get('DATABASE_URL', '')       # sem isso, roda no modo antigo (só você)
+HAS_DB        = bool(DATABASE_URL)
+ASAAS_KEY     = os.environ.get('ASAAS_KEY', '')
+ASAAS_URL     = os.environ.get('ASAAS_URL', 'https://api-sandbox.asaas.com/v3')  # produção: https://api.asaas.com/v3
+WEBHOOK_TOKEN = os.environ.get('WEBHOOK_TOKEN', '')      # token do webhook do Asaas
+TG_SECRET     = os.environ.get('TG_SECRET', '')          # parte secreta da URL do webhook do Telegram
+PUBLIC_URL    = os.environ.get('PUBLIC_URL', '') or os.environ.get('RENDER_EXTERNAL_URL', '')
+PRECO         = float(os.environ.get('ASSINATURA_PRECO', '14.90'))
+LIMITES       = {'free': 3, 'pro': 30}
+
+# ─── Estado em memória (chaves por usuário+ticker) ───────
+last_known_price  = {}
+lowest_since_drop = {}
+target_alerted    = {}
+daily_done        = {}
+volume_alerted    = {}
 
 # ─── Chaves das APIs ─────────────────────────────────────
 TWELVE_KEY  = os.environ.get('TWELVE_KEY', '')
-BRAPI_TOKEN = os.environ.get('BRAPI_TOKEN', '')  # opcional (MGLU3 funciona sem token em modo de teste)
+BRAPI_TOKEN = os.environ.get('BRAPI_TOKEN', '')
 
 # ─── Mercados ────────────────────────────────────────────
-# Horários em hora local de cada bolsa. CONFIRA os horários da B3 e ajuste se precisar.
 MARKETS = {
     'US': {'tz': 'America/New_York',  'cur': '$',  'open': (9, 30),  'close': (16, 0)},
     'B3': {'tz': 'America/Sao_Paulo', 'cur': 'R$ ', 'open': (10, 0), 'close': (17, 55)},
 }
 
 def is_b3(ticker):
-    """Ticker da B3: 4 letras + 1 ou 2 dígitos (MGLU3, PETR4, ITUB4, TAEE11...)."""
     return re.fullmatch(r'[A-Z]{4}\d{1,2}', ticker) is not None
 
 def market_of(ticker):
     return MARKETS['B3'] if is_b3(ticker) else MARKETS['US']
 
 def intraday_pct(ticker):
-    """Permite um limite próprio por ação, ex.: variável INTRADAY_PCT_MGLU3=1"""
     return float(os.environ.get(f'INTRADAY_PCT_{ticker}', INTRADAY_PCT))
 
 def intraday_up_pct(ticker):
@@ -75,13 +85,104 @@ def session_state(mkt):
         return 'REGULAR'
     return 'POST'
 
+# ─── Banco de dados ──────────────────────────────────────
+if HAS_DB:
+    import psycopg2
+
+@contextmanager
+def db():
+    conn = psycopg2.connect(DATABASE_URL)
+    try:
+        with conn:                      # commit ao sair, rollback em erro
+            with conn.cursor() as cur:
+                yield cur
+    finally:
+        conn.close()
+
+def init_db():
+    with db() as cur:
+        cur.execute("""
+            create table if not exists users (
+              telegram_id bigint primary key,
+              plan text default 'free',
+              plan_until timestamptz,
+              asaas_customer text,
+              created_at timestamptz default now());
+            create table if not exists watchlist (
+              id serial primary key,
+              telegram_id bigint references users(telegram_id),
+              ticker text not null,
+              unique (telegram_id, ticker));
+            create table if not exists payments (
+              id text primary key,
+              telegram_id bigint references users(telegram_id),
+              amount numeric,
+              status text default 'pending',
+              created_at timestamptz default now());
+        """)
+
+def seed_owner():
+    """Garante que VOCÊ é Pro (sem vencimento) e tem seus tickers do env na lista."""
+    if not CHAT_ID:
+        return
+    uid = int(CHAT_ID)
+    with db() as cur:
+        cur.execute("""insert into users(telegram_id, plan, plan_until)
+                       values (%s, 'pro', '2099-01-01')
+                       on conflict (telegram_id)
+                       do update set plan='pro', plan_until='2099-01-01'""", (uid,))
+        cur.execute("select count(*) from watchlist where telegram_id=%s", (uid,))
+        if cur.fetchone()[0] == 0:          # só semeia se a lista estiver vazia
+            for t in TICKERS:
+                cur.execute("""insert into watchlist(telegram_id, ticker) values (%s,%s)
+                               on conflict do nothing""", (uid, t))
+
+def ensure_user(uid):
+    with db() as cur:
+        cur.execute("insert into users(telegram_id) values (%s) on conflict do nothing", (uid,))
+        cur.execute("select plan, plan_until, asaas_customer from users where telegram_id=%s", (uid,))
+        return cur.fetchone()
+
+def alvos():
+    """{ticker: [(chat_id, plano), ...]}"""
+    if not HAS_DB:
+        return {t: [(CHAT_ID, 'pro')] for t in TICKERS} if CHAT_ID else {}
+    out = {}
+    with db() as cur:
+        cur.execute("""select w.ticker, w.telegram_id, u.plan
+                       from watchlist w join users u using (telegram_id)""")
+        for t, uid, plan in cur.fetchall():
+            out.setdefault(t, []).append((uid, plan))
+    return out
+
+def checar_vencidos():
+    with db() as cur:
+        cur.execute("""update users set plan='free'
+                       where plan='pro' and plan_until < now()
+                       returning telegram_id""")
+        vencidos = [r[0] for r in cur.fetchall()]
+    for uid in vencidos:
+        send_telegram('⏳ Seu plano Pro venceu. Use /planos para renovar.', uid)
+
+def ativar_pro(pay_id, dias=30):
+    """Idempotente: só ativa se o pagamento ainda estiver 'pending'."""
+    with db() as cur:
+        cur.execute("""update payments set status='paid'
+                       where id=%s and status='pending' returning telegram_id""", (pay_id,))
+        row = cur.fetchone()
+        if not row:
+            return None
+        uid = row[0]
+        cur.execute("""update users set plan='pro',
+                       plan_until = greatest(coalesce(plan_until, now()), now()) + interval '30 days'
+                       where telegram_id=%s""", (uid,))
+    return uid
+
 # ─── Busca de preço ──────────────────────────────────────
 def fetch_price_twelve(ticker):
     sess = requests.Session()
     sess.headers.update({'User-Agent': 'curl/8.0', 'Accept': '*/*'})
-
     url = f'https://api.twelvedata.com/quote?symbol={ticker}&apikey={TWELVE_KEY}'
-    # Não imprime a URL: ela contém a chave da API
     print(f'[TWELVE] GET quote {ticker}', flush=True)
     try:
         r = sess.get(url, timeout=(5, 10))
@@ -90,30 +191,24 @@ def fetch_price_twelve(ticker):
         print(f'[TWELVE] EXCEPTION na requisição: {type(e).__name__}: {e}', flush=True)
         raise
     data = r.json()
-    print(f'[TWELVE] Resposta (quote): {data}', flush=True)
-
     if 'close' not in data:
         raise Exception(f'Sem dados para {ticker}: {data}')
 
-    price      = float(data['close'])
-    open_price = float(data.get('open', price))
-    prev_close = float(data.get('previous_close', price))
-    day_high   = float(data.get('high', price))
-    day_low    = float(data.get('low', price))
-    volume     = float(data.get('volume', 0))
-    avg_volume = float(data.get('average_volume', 0))
-
+    price = float(data['close'])
     return {
-        'ticker': ticker, 'name': ticker, 'price': price, 'open': open_price,
-        'prev_close': prev_close, 'day_high': day_high, 'day_low': day_low,
-        'volume': volume, 'avg_volume': avg_volume,
+        'ticker': ticker, 'name': data.get('name') or ticker, 'price': price,
+        'open': float(data.get('open', price)),
+        'prev_close': float(data.get('previous_close', price)),
+        'day_high': float(data.get('high', price)),
+        'day_low': float(data.get('low', price)),
+        'volume': float(data.get('volume', 0)),
+        'avg_volume': float(data.get('average_volume', 0)),
     }
 
 def fetch_price_brapi(ticker):
     headers = {'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json'}
     if BRAPI_TOKEN:
         headers['Authorization'] = f'Bearer {BRAPI_TOKEN}'
-
     url = f'https://brapi.dev/api/quote/{ticker}'
     print(f'[BRAPI] GET quote {ticker}', flush=True)
     try:
@@ -128,9 +223,6 @@ def fetch_price_brapi(ticker):
         raise Exception(f'Sem dados para {ticker} (HTTP {r.status_code}): {data}')
 
     q = results[0]
-    print(f'[BRAPI] {ticker}: preço={q.get("regularMarketPrice")} '
-          f'tempo={q.get("regularMarketTime")}', flush=True)
-
     price = float(q['regularMarketPrice'])
     return {
         'ticker':     ticker,
@@ -152,22 +244,27 @@ def fetch_price(ticker):
     data['mkt']   = mkt
     return data
 
-# ─── Telegram ────────────────────────────────────────────
-def send_telegram(msg):
-    if not TELEGRAM_TOKEN or not CHAT_ID:
+# ─── Telegram (envio) ────────────────────────────────────
+def send_telegram(msg, chat_id=None):
+    chat_id = chat_id or CHAT_ID
+    if not TELEGRAM_TOKEN or not chat_id:
         return False
-    r = requests.post(
-        f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage',
-        json={'chat_id': CHAT_ID, 'text': msg, 'parse_mode': 'HTML', 'disable_web_page_preview': True},
-        timeout=10
-    )
-    ok = r.json().get('ok', False)
-    print(f'[TELEGRAM] {"✅ Enviado" if ok else "❌ Erro: " + str(r.json())}')
-    return ok
+    try:
+        r = requests.post(
+            f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage',
+            json={'chat_id': chat_id, 'text': msg, 'parse_mode': 'HTML',
+                  'disable_web_page_preview': True},
+            timeout=10
+        )
+        ok = r.json().get('ok', False)
+        print(f'[TELEGRAM] {chat_id}: {"✅ Enviado" if ok else "❌ Erro: " + str(r.json())}')
+        return ok
+    except Exception as e:
+        print(f'[TELEGRAM] Falha ao enviar para {chat_id}: {e}')
+        return False
 
-# ─── Checagem por ticker ─────────────────────────────────
-def check_ticker(ticker):
-    data       = fetch_price(ticker)
+# ─── Checagem por ticker e usuário ───────────────────────
+def check_ticker(ticker, data, chat_id, plan='free'):
     price      = data['price']
     prev_close = data['prev_close']
     cur        = data['cur']
@@ -176,17 +273,23 @@ def check_ticker(ticker):
     now_str    = datetime.now().strftime('%d/%m/%Y %H:%M:%S')
     today      = datetime.now().strftime('%Y-%m-%d')
 
-    print(f'[{ticker}] {cur}{price:.2f} ({pct_day:+.2f}%) | {data["state"]}')
+    uk       = f'{chat_id}_{ticker}'          # chave única por usuário+ticker
+    is_pro   = (plan == 'pro')
+    is_owner = bool(CHAT_ID) and str(chat_id) == str(CHAT_ID)
 
-    # ── Opção 1: Queda/Alta acumulada no dia (vs. fechamento anterior) ──
-    # Alerta a cada NÍVEL de X% atingido, sempre comparando com o fechamento anterior.
+    def send(msg):
+        return send_telegram(msg, chat_id)
+
+    print(f'[{ticker}] {cur}{price:.2f} ({pct_day:+.2f}%) | {data["state"]} | user={chat_id}')
+
+    # ── Queda/Alta acumulada no dia (todos os planos) ──
     down_step = intraday_pct(ticker)
     if down_step > 0:
         level_reached = int(abs(pct_day) // down_step) if pct_day < 0 else 0
-        alert_key = f'{ticker}_down_{today}_{level_reached}'
+        alert_key = f'{uk}_down_{today}_{level_reached}'
         if level_reached >= 1 and not target_alerted.get(alert_key):
             target_alerted[alert_key] = True
-            send_telegram(
+            send(
                 f'📉 <b>QUEDA NO DIA — {ticker}</b>\n\n'
                 f'🏷 <b>{data["name"]}</b>\n'
                 f'💵 Preço atual: <b>{cur}{price:.2f}</b>\n'
@@ -199,10 +302,10 @@ def check_ticker(ticker):
     up_step = intraday_up_pct(ticker)
     if up_step > 0:
         level_reached_up = int(pct_day // up_step) if pct_day > 0 else 0
-        alert_key_up = f'{ticker}_up_{today}_{level_reached_up}'
+        alert_key_up = f'{uk}_up_{today}_{level_reached_up}'
         if level_reached_up >= 1 and not target_alerted.get(alert_key_up):
             target_alerted[alert_key_up] = True
-            send_telegram(
+            send(
                 f'📈 <b>ALTA NO DIA — {ticker}</b>\n\n'
                 f'🏷 <b>{data["name"]}</b>\n'
                 f'💵 Preço atual: <b>{cur}{price:.2f}</b>\n'
@@ -214,16 +317,15 @@ def check_ticker(ticker):
 
     last_known_price[ticker] = price
 
-    # ── Melhoria: Alerta de recuperação ───────────────────
-    if RECOVERY_ALERT:
-        lowest = lowest_since_drop.get(ticker)
+    # ── Recuperação (só Pro) ──
+    if RECOVERY_ALERT and is_pro:
+        lowest = lowest_since_drop.get(uk)
         if lowest is None or price < lowest:
-            lowest_since_drop[ticker] = price
-            lowest = price
+            lowest_since_drop[uk] = price
         else:
             recovery = ((price - lowest) / lowest * 100)
             if recovery >= RECOVERY_PCT:
-                send_telegram(
+                send(
                     f'📈 <b>RECUPERAÇÃO — {ticker}</b>\n\n'
                     f'🏷 <b>{data["name"]}</b>\n'
                     f'💵 Preço atual: <b>{cur}{price:.2f}</b>\n'
@@ -233,17 +335,17 @@ def check_ticker(ticker):
                     f'⏰ {now_str}\n'
                     f'<i>⚠️ Não é recomendação de investimento.</i>'
                 )
-                lowest_since_drop[ticker] = price  # reseta a base para próxima recuperação
+                lowest_since_drop[uk] = price
 
-    # ── Melhoria: Alerta de volume anormal ────────────────
-    if VOLUME_ALERT:
+    # ── Volume anormal (só Pro) ──
+    if VOLUME_ALERT and is_pro:
         volume     = data.get('volume', 0)
         avg_volume = data.get('avg_volume', 0)
-        vol_key    = f'{ticker}_{today}'
+        vol_key    = f'{uk}_{today}'
         if avg_volume > 0 and volume >= avg_volume * VOLUME_MULTIPLIER and not volume_alerted.get(vol_key):
             volume_alerted[vol_key] = True
             vol_ratio = volume / avg_volume
-            send_telegram(
+            send(
                 f'📊 <b>VOLUME ANORMAL — {ticker}</b>\n\n'
                 f'🏷 <b>{data["name"]}</b>\n'
                 f'💵 Preço atual: <b>{cur}{price:.2f}</b>\n'
@@ -255,32 +357,30 @@ def check_ticker(ticker):
                 f'<i>⚠️ Pode indicar movimento forte. Não é recomendação de investimento.</i>'
             )
 
-    # ── Opção 2: Faixa de preço alvo ─────────────────────
-    # Obs.: TARGET_PRICE é um valor único e vale para todos os tickers.
-    # Se for pensado para a ARR (em US$), pode disparar errado na MGLU3 (em R$).
-    # Para alvo próprio: variáveis TARGET_PRICE_MGLU3 e TARGET_DIR_MGLU3.
-    t_price = float(os.environ.get(f'TARGET_PRICE_{ticker}', TARGET_PRICE))
-    t_dir   = os.environ.get(f'TARGET_DIR_{ticker}', TARGET_DIR)
-    if t_price > 0:
-        crossed = price < t_price if t_dir == 'below' else price > t_price
-        key = f'{ticker}_{t_dir}_{t_price}'
-        if crossed and not target_alerted.get(key):
-            target_alerted[key] = True
-            dir_label = 'caiu abaixo de' if t_dir == 'below' else 'subiu acima de'
-            send_telegram(
-                f'{"📉" if t_dir == "below" else "📈"} <b>ALERTA DE PREÇO ALVO — {ticker}</b>\n\n'
-                f'🏷 <b>{data["name"]}</b>\n'
-                f'💵 Preço atual: <b>{cur}{price:.2f}</b>\n'
-                f'🎯 Cruzou o alvo: <b>{dir_label} {cur}{t_price:.2f}</b>\n'
-                f'📊 Variação no dia: {pct_day:.2f}%\n'
-                f'⏰ {now_str}\n'
-                f'<i>⚠️ Não é recomendação de investimento.</i>'
-            )
-        if not crossed and target_alerted.get(key):
-            del target_alerted[key]
+    # ── Preço alvo (só dono, pois o valor vem das variáveis de ambiente) ──
+    if is_owner:
+        t_price = float(os.environ.get(f'TARGET_PRICE_{ticker}', TARGET_PRICE))
+        t_dir   = os.environ.get(f'TARGET_DIR_{ticker}', TARGET_DIR)
+        if t_price > 0:
+            crossed = price < t_price if t_dir == 'below' else price > t_price
+            key = f'{uk}_{t_dir}_{t_price}'
+            if crossed and not target_alerted.get(key):
+                target_alerted[key] = True
+                dir_label = 'caiu abaixo de' if t_dir == 'below' else 'subiu acima de'
+                send(
+                    f'{"📉" if t_dir == "below" else "📈"} <b>ALERTA DE PREÇO ALVO — {ticker}</b>\n\n'
+                    f'🏷 <b>{data["name"]}</b>\n'
+                    f'💵 Preço atual: <b>{cur}{price:.2f}</b>\n'
+                    f'🎯 Cruzou o alvo: <b>{dir_label} {cur}{t_price:.2f}</b>\n'
+                    f'📊 Variação no dia: {pct_day:.2f}%\n'
+                    f'⏰ {now_str}\n'
+                    f'<i>⚠️ Não é recomendação de investimento.</i>'
+                )
+            if not crossed and target_alerted.get(key):
+                del target_alerted[key]
 
-    # ── Opção 3: Resumo diário (no horário de cada bolsa) ─
-    if DAILY_SUMMARY:
+    # ── Resumo diário: abertura e fechamento (só Pro) ──
+    if DAILY_SUMMARY and is_pro:
         local_now, mins = minutes_now(mkt)
         open_min  = mkt['open'][0] * 60 + mkt['open'][1]
         close_min = mkt['close'][0] * 60 + mkt['close'][1]
@@ -288,10 +388,10 @@ def check_ticker(ticker):
         close_lbl = f'{mkt["close"][0]}h{mkt["close"][1]:02d}'
 
         if 0 <= mins - open_min <= 5 and local_now.weekday() < 5 \
-                and not daily_done.get(f'{ticker}_open_{today}'):
-            daily_done[f'{ticker}_open_{today}'] = True
+                and not daily_done.get(f'{uk}_open_{today}'):
+            daily_done[f'{uk}_open_{today}'] = True
             open_pct = ((data['open'] - prev_close) / prev_close * 100) if prev_close else 0
-            send_telegram(
+            send(
                 f'🔔 <b>ABERTURA DO PREGÃO — {ticker}</b>\n\n'
                 f'🏷 <b>{data["name"]}</b>\n'
                 f'💵 Abertura: <b>{cur}{data["open"]:.2f}</b>\n'
@@ -302,9 +402,9 @@ def check_ticker(ticker):
             )
 
         if 0 <= mins - close_min <= 5 and local_now.weekday() < 5 \
-                and not daily_done.get(f'{ticker}_close_{today}'):
-            daily_done[f'{ticker}_close_{today}'] = True
-            send_telegram(
+                and not daily_done.get(f'{uk}_close_{today}'):
+            daily_done[f'{uk}_close_{today}'] = True
+            send(
                 f'{"📉" if pct_day < 0 else "📈"} <b>FECHAMENTO DO PREGÃO — {ticker}</b>\n\n'
                 f'🏷 <b>{data["name"]}</b>\n'
                 f'💵 Fechamento: <b>{cur}{price:.2f}</b>\n'
@@ -317,7 +417,6 @@ def check_ticker(ticker):
 
 # ─── Loop principal ───────────────────────────────────────
 def is_market_hours(ticker):
-    """True se a bolsa do ticker está em pregão (dias úteis). EUA inclui after-hours até 20h ET."""
     mkt = market_of(ticker)
     now, mins = minutes_now(mkt)
     if now.weekday() >= 5:
@@ -326,36 +425,211 @@ def is_market_hours(ticker):
     if is_b3(ticker):
         close_min = mkt['close'][0] * 60 + mkt['close'][1]
     else:
-        close_min = 20 * 60  # inclui after-hours até 20h ET
+        close_min = 20 * 60
     return open_min <= mins <= close_min
 
 def monitor_loop():
-    print(f'[MONITOR] Tickers: {TICKERS} | Intervalo: {CHECK_INTERVAL}s')
-    print(f'[MONITOR] TWELVE_KEY configurada: {"SIM" if TWELVE_KEY else "NAO"}')
-    print(f'[MONITOR] BRAPI_TOKEN configurado: {"SIM" if BRAPI_TOKEN else "NAO (modo teste)"}')
-    print(f'[MONITOR] Horário de silêncio: {"ATIVO (só pregão)" if MARKET_HOURS_ONLY else "INATIVO (24h)"}')
-    print(f'[MONITOR] Alerta de recuperação: {"ATIVO" if RECOVERY_ALERT else "INATIVO"} ({RECOVERY_PCT}%)')
-    print(f'[MONITOR] Alerta de volume: {"ATIVO" if VOLUME_ALERT else "INATIVO"} ({VOLUME_MULTIPLIER}x)')
+    print(f'[MONITOR] Modo: {"MULTIUSUÁRIO (banco)" if HAS_DB else "LEGADO (só dono)"} | Intervalo: {CHECK_INTERVAL}s')
+    print(f'[MONITOR] TWELVE_KEY: {"SIM" if TWELVE_KEY else "NAO"} | BRAPI_TOKEN: {"SIM" if BRAPI_TOKEN else "NAO (modo teste)"}')
+    print(f'[MONITOR] Silêncio fora do pregão: {"ATIVO" if MARKET_HOURS_ONLY else "INATIVO"} | '
+          f'Recuperação: {"ATIVO" if RECOVERY_ALERT else "INATIVO"} | Volume: {"ATIVO" if VOLUME_ALERT else "INATIVO"}')
     while True:
         print(f'[MONITOR] Iniciando checagem... {datetime.now()}')
-        for ticker in TICKERS:
+        if HAS_DB:
+            try:
+                checar_vencidos()
+            except Exception as e:
+                print(f'[ERRO] checar_vencidos: {e}')
+        try:
+            mapa = alvos()
+        except Exception as e:
+            print(f'[ERRO] alvos: {e}')
+            mapa = {}
+
+        for ticker, users in mapa.items():
             if MARKET_HOURS_ONLY and not is_market_hours(ticker):
                 print(f'[MONITOR] {ticker}: fora do horário de pregão — pulando')
                 continue
             try:
-                print(f'[MONITOR] Checando {ticker}...')
-                check_ticker(ticker)
+                data = fetch_price(ticker)       # 1 chamada de API por ticker
             except Exception as e:
                 import traceback
                 print(f'[ERRO] {ticker}: {e}')
                 print(traceback.format_exc())
+                continue
+            for uid, plan in users:
+                try:
+                    check_ticker(ticker, data, uid, plan)
+                except Exception as e:
+                    print(f'[ERRO] {ticker} user={uid}: {e}')
         print(f'[MONITOR] Aguardando {CHECK_INTERVAL}s...')
         time.sleep(CHECK_INTERVAL)
 
-# ─── Flask (keepalive + status) ───────────────────────────
+# ─── Bot interativo (comandos) ───────────────────────────
+bot = telebot.TeleBot(TELEGRAM_TOKEN or 'x', threaded=False)
+
+TEXTO_PLANOS = (
+    f'<b>Planos</b>\n\n'
+    f'🆓 <b>Grátis</b>: até {LIMITES["free"]} ativos, alertas de queda/alta no dia\n'
+    f'⭐ <b>Pro</b> (R$ {PRECO:.2f}/mês): até {LIMITES["pro"]} ativos, recuperação, '
+    f'volume anormal, abertura e fechamento do pregão\n\n'
+    f'<i>Os alertas são informativos e não constituem recomendação de investimento.</i>'
+)
+
+def teclado_assinar():
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton(f'⭐ Assinar Pro (R$ {PRECO:.2f}/mês)', callback_data='assinar'))
+    return kb
+
+def asaas(method, path, **kw):
+    r = requests.request(method, f'{ASAAS_URL}{path}',
+                         headers={'access_token': ASAAS_KEY}, timeout=15, **kw)
+    data = r.json()
+    if r.status_code >= 300:
+        raise Exception(f'Asaas {r.status_code}: {data}')
+    return data
+
+def criar_pix(uid, customer_id):
+    venc = (datetime.now() + timedelta(days=1)).strftime('%Y-%m-%d')
+    pay = asaas('POST', '/payments', json={
+        'customer': customer_id, 'billingType': 'PIX', 'value': PRECO,
+        'dueDate': venc, 'externalReference': str(uid),
+        'description': 'Bot Monitor - Plano Pro 30 dias'})
+    qr = asaas('GET', f'/payments/{pay["id"]}/pixQrCode')
+    with db() as cur:
+        cur.execute("insert into payments(id, telegram_id, amount) values (%s,%s,%s)",
+                    (pay['id'], uid, PRECO))
+    return qr['payload']
+
+def iniciar_assinatura(uid, chat_id):
+    if not ASAAS_KEY:
+        return bot.send_message(chat_id, 'Assinatura indisponível no momento.')
+    _, _, customer = ensure_user(uid)
+    if not customer:
+        return bot.send_message(
+            chat_id,
+            'Para gerar o Pix, envie seu CPF (só números) assim:\n<code>/cpf 12345678900</code>\n\n'
+            'Ele é usado só para emitir a cobrança e não fica salvo no bot.',
+            parse_mode='HTML')
+    try:
+        codigo = criar_pix(uid, customer)
+    except Exception as e:
+        print(f'[ASAAS] erro ao criar Pix: {e}')
+        return bot.send_message(chat_id, 'Não consegui gerar o Pix agora. Tente de novo em instantes.')
+    bot.send_message(chat_id, 'Copie o código Pix abaixo e pague no app do seu banco. '
+                              'O plano é ativado automaticamente após o pagamento:')
+    bot.send_message(chat_id, f'<code>{codigo}</code>', parse_mode='HTML')
+
+@bot.message_handler(commands=['start', 'ajuda', 'help'])
+def cmd_start(m):
+    ensure_user(m.from_user.id)
+    bot.send_message(m.chat.id,
+        '👋 Eu monitoro ações e aviso você no Telegram.\n\n'
+        '/add PETR4 — adicionar ativo\n'
+        '/remove PETR4 — remover ativo\n'
+        '/lista — seus ativos\n'
+        '/meuplano — seu plano\n'
+        '/planos — ver planos e assinar\n\n'
+        'Aceito ativos da B3 (ex.: PETR4, MGLU3) e dos EUA (ex.: AAPL).\n'
+        '<i>Alertas informativos, não são recomendação de investimento.</i>',
+        parse_mode='HTML')
+
+@bot.message_handler(commands=['planos'])
+def cmd_planos(m):
+    bot.send_message(m.chat.id, TEXTO_PLANOS, parse_mode='HTML', reply_markup=teclado_assinar())
+
+@bot.message_handler(commands=['assinar'])
+def cmd_assinar(m):
+    iniciar_assinatura(m.from_user.id, m.chat.id)
+
+@bot.callback_query_handler(func=lambda c: c.data == 'assinar')
+def cb_assinar(c):
+    bot.answer_callback_query(c.id)
+    iniciar_assinatura(c.from_user.id, c.message.chat.id)
+
+@bot.message_handler(commands=['meuplano'])
+def cmd_meuplano(m):
+    plan, until, _ = ensure_user(m.from_user.id)
+    if plan == 'pro' and until:
+        bot.reply_to(m, f'⭐ Plano Pro até {until.astimezone(pytz.timezone("America/Sao_Paulo")):%d/%m/%Y}')
+    else:
+        bot.reply_to(m, '🆓 Plano Grátis. Use /planos para conhecer o Pro.')
+
+@bot.message_handler(commands=['cpf'])
+def cmd_cpf(m):
+    uid = m.from_user.id
+    p = m.text.split()
+    try:
+        bot.delete_message(m.chat.id, m.message_id)   # apaga a mensagem com o CPF
+    except Exception:
+        pass
+    if len(p) < 2 or not ASAAS_KEY:
+        return bot.send_message(m.chat.id, 'Use: /cpf 12345678900')
+    doc = re.sub(r'\D', '', p[1])
+    if len(doc) not in (11, 14):
+        return bot.send_message(m.chat.id, 'CPF/CNPJ inválido. Envie só os números.')
+    ensure_user(uid)
+    try:
+        cust = asaas('POST', '/customers', json={
+            'name': m.from_user.first_name or 'Cliente', 'cpfCnpj': doc,
+            'externalReference': str(uid)})
+    except Exception as e:
+        print(f'[ASAAS] erro ao criar cliente: {e}')
+        return bot.send_message(m.chat.id, 'Não consegui validar esse CPF. Confira e tente de novo.')
+    with db() as cur:
+        cur.execute("update users set asaas_customer=%s where telegram_id=%s", (cust['id'], uid))
+    bot.send_message(m.chat.id, '✅ Dados registrados. Toque em /assinar para gerar o Pix.')
+
+@bot.message_handler(commands=['add'])
+def cmd_add(m):
+    p = m.text.split()
+    if len(p) < 2:
+        return bot.reply_to(m, 'Use: /add PETR4')
+    t = p[1].upper()
+    if not (is_b3(t) or re.fullmatch(r'[A-Z]{1,5}', t)):
+        return bot.reply_to(m, 'Ticker inválido. Ex.: PETR4, MGLU3, AAPL.')
+    uid = m.from_user.id
+    plan, _, _ = ensure_user(uid)
+    with db() as cur:
+        cur.execute("select count(*) from watchlist where telegram_id=%s", (uid,))
+        qtd = cur.fetchone()[0]
+        cur.execute("select 1 from watchlist where telegram_id=%s and ticker=%s", (uid, t))
+        ja_tem = cur.fetchone() is not None
+    if ja_tem:
+        return bot.reply_to(m, f'{t} já está na sua lista.')
+    if qtd >= LIMITES[plan]:
+        return bot.reply_to(m, f'Você atingiu o limite do plano {plan} ({LIMITES[plan]} ativos). /planos')
+    try:
+        fetch_price(t)                      # confirma que o ativo existe
+    except Exception:
+        return bot.reply_to(m, f'Não encontrei dados para {t}. Confira o código.')
+    with db() as cur:
+        cur.execute("insert into watchlist(telegram_id, ticker) values (%s,%s) on conflict do nothing",
+                    (uid, t))
+    bot.reply_to(m, f'✅ {t} adicionado.')
+
+@bot.message_handler(commands=['remove'])
+def cmd_remove(m):
+    p = m.text.split()
+    if len(p) < 2:
+        return bot.reply_to(m, 'Use: /remove PETR4')
+    with db() as cur:
+        cur.execute("delete from watchlist where telegram_id=%s and ticker=%s",
+                    (m.from_user.id, p[1].upper()))
+    bot.reply_to(m, '🗑 Removido.')
+
+@bot.message_handler(commands=['lista'])
+def cmd_lista(m):
+    with db() as cur:
+        cur.execute("select ticker from watchlist where telegram_id=%s order by ticker", (m.from_user.id,))
+        ts = [r[0] for r in cur.fetchall()]
+    bot.reply_to(m, ', '.join(ts) if ts else 'Lista vazia. Use /add PETR4')
+
+# ─── Flask (keepalive, status, webhooks) ─────────────────
 @app.route('/')
 def index():
-    return jsonify({'status': 'online', 'tickers': TICKERS, 'precos': last_known_price})
+    return jsonify({'status': 'online', 'modo': 'multiusuario' if HAS_DB else 'legado',
+                    'precos': last_known_price})
 
 @app.route('/ping')
 def ping():
@@ -365,6 +639,62 @@ def ping():
 def status():
     return jsonify(last_known_price)
 
-if __name__ == '__main__':
+@app.post('/tg/<secret>')
+def tg_webhook(secret):
+    if not TG_SECRET or secret != TG_SECRET:
+        return '', 403
+    try:
+        update = types.Update.de_json(request.stream.read().decode('utf-8'))
+        bot.process_new_updates([update])
+    except Exception as e:
+        print(f'[TG] erro ao processar update: {e}')
+    return '', 200
+
+@app.post('/webhook/pix')
+def webhook_pix():
+    if not WEBHOOK_TOKEN or request.headers.get('asaas-access-token') != WEBHOOK_TOKEN:
+        return '', 401
+    ev = request.get_json(silent=True) or {}
+    if ev.get('event') in ('PAYMENT_RECEIVED', 'PAYMENT_CONFIRMED'):
+        pay_id = (ev.get('payment') or {}).get('id')
+        try:
+            uid = ativar_pro(pay_id) if pay_id else None
+            if uid:
+                send_telegram('✅ Pagamento confirmado! Plano <b>Pro</b> ativo por 30 dias.', uid)
+        except Exception as e:
+            print(f'[PIX] erro ao ativar: {e}')
+            return '', 500          # Asaas tenta de novo
+    return '', 200
+
+# ─── Inicialização ───────────────────────────────────────
+_started = False
+
+def setup_telegram_webhook():
+    if TELEGRAM_TOKEN and TG_SECRET and PUBLIC_URL:
+        try:
+            bot.remove_webhook()
+            bot.set_webhook(url=f'{PUBLIC_URL.rstrip("/")}/tg/{TG_SECRET}')
+            print('[TG] Webhook registrado')
+        except Exception as e:
+            print(f'[TG] Falha ao registrar webhook: {e}')
+    else:
+        print('[TG] Webhook NÃO registrado (faltam TG_SECRET ou PUBLIC_URL)')
+
+def start_background():
+    global _started
+    if _started:
+        return
+    _started = True
+    if HAS_DB:
+        try:
+            init_db()
+            seed_owner()
+            setup_telegram_webhook()
+        except Exception as e:
+            print(f'[INIT] Erro ao preparar banco: {e}')
     threading.Thread(target=monitor_loop, daemon=True).start()
+
+start_background()
+
+if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
