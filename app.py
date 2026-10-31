@@ -625,6 +625,64 @@ def cmd_lista(m):
         ts = [r[0] for r in cur.fetchall()]
     bot.reply_to(m, ', '.join(ts) if ts else 'Lista vazia. Use /add PETR4')
 
+# ─── Comandos de administrador ───────────────────────────
+def eh_admin(m):
+    return bool(CHAT_ID) and str(m.from_user.id) == str(CHAT_ID)
+
+@bot.message_handler(commands=['id'])
+def cmd_id(m):
+    bot.reply_to(m, f'Seu ID: {m.from_user.id}')
+
+@bot.message_handler(commands=['admin'])
+def cmd_admin(m):
+    if not eh_admin(m):
+        return
+    with db() as cur:
+        cur.execute("select count(*), count(*) filter (where plan='pro') from users")
+        total, pro = cur.fetchone()
+        cur.execute("select count(*) from watchlist")
+        ativos = cur.fetchone()[0]
+        cur.execute("""select coalesce(sum(amount),0) from payments
+                       where status='paid' and created_at >= date_trunc('month', now())""")
+        mes = cur.fetchone()[0]
+    bot.reply_to(m, f'👥 Usuários: {total}\n⭐ Pro (inclui você): {pro}\n'
+                    f'📈 Ativos monitorados: {ativos}\n💰 Recebido no mês: R$ {float(mes):.2f}')
+
+@bot.message_handler(commands=['darpro'])
+def cmd_darpro(m):
+    if not eh_admin(m):
+        return
+    p = m.text.split()
+    if len(p) < 2 or not p[1].isdigit():
+        return bot.reply_to(m, 'Use: /darpro ID [dias]')
+    uid = int(p[1])
+    dias = int(p[2]) if len(p) > 2 and p[2].isdigit() else 30
+    with db() as cur:
+        cur.execute("insert into users(telegram_id) values (%s) on conflict do nothing", (uid,))
+        cur.execute("""update users set plan='pro',
+                       plan_until = greatest(coalesce(plan_until, now()), now()) + %s * interval '1 day'
+                       where telegram_id=%s""", (dias, uid))
+    send_telegram(f'🎁 Você ganhou {dias} dias de plano Pro!', uid)
+    bot.reply_to(m, '✅ Pro liberado.')
+
+@bot.message_handler(commands=['avisar'])
+def cmd_avisar(m):
+    if not eh_admin(m):
+        return
+    import html
+    texto = html.escape(m.text.partition(' ')[2].strip())
+    if not texto:
+        return bot.reply_to(m, 'Use: /avisar sua mensagem')
+    with db() as cur:
+        cur.execute("select telegram_id from users")
+        ids = [r[0] for r in cur.fetchall()]
+    enviados = 0
+    for uid in ids:
+        if send_telegram(texto, uid):
+            enviados += 1
+        time.sleep(0.05)
+    bot.reply_to(m, f'Enviado para {enviados} de {len(ids)}.')
+
 # ─── Flask (keepalive, status, webhooks) ─────────────────
 @app.route('/')
 def index():
