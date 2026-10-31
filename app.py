@@ -37,8 +37,10 @@ ASAAS_URL     = os.environ.get('ASAAS_URL', 'https://api-sandbox.asaas.com/v3') 
 WEBHOOK_TOKEN = os.environ.get('WEBHOOK_TOKEN', '')      # token do webhook do Asaas
 TG_SECRET     = os.environ.get('TG_SECRET', '')          # parte secreta da URL do webhook do Telegram
 PUBLIC_URL    = os.environ.get('PUBLIC_URL', '') or os.environ.get('RENDER_EXTERNAL_URL', '')
-PRECO         = float(os.environ.get('ASSINATURA_PRECO', '14.90'))
-LIMITES       = {'free': 3, 'pro': 30}
+PRECO         = float(os.environ.get('ASSINATURA_PRECO', '20.00'))
+TRIAL_DIAS    = int(os.environ.get('TRIAL_DIAS', '7'))          # dias de teste grátis
+LIMITE_ATIVOS = int(os.environ.get('LIMITE_ATIVOS', '30'))
+KB_ASSINAR    = {'inline_keyboard': [[{'text': f'⭐ Assinar (R$ {PRECO:.2f}/mês)', 'callback_data': 'assinar'}]]}
 
 # ─── Estado em memória (chaves por usuário+ticker) ───────
 last_known_price  = {}
@@ -120,6 +122,7 @@ def init_db():
               status text default 'pending',
               created_at timestamptz default now());
         """)
+        cur.execute("alter table users add column if not exists warned boolean default false")
 
 def seed_owner():
     """Garante que VOCÊ é Pro (sem vencimento) e tem seus tickers do env na lista."""
@@ -138,10 +141,16 @@ def seed_owner():
                                on conflict do nothing""", (uid, t))
 
 def ensure_user(uid):
+    """Cria o usuário (já com o teste grátis) se for o primeiro contato."""
     with db() as cur:
-        cur.execute("insert into users(telegram_id) values (%s) on conflict do nothing", (uid,))
+        cur.execute("""insert into users(telegram_id, plan, plan_until)
+                       values (%s, 'pro', now() + %s * interval '1 day')
+                       on conflict do nothing""", (uid, TRIAL_DIAS))
         cur.execute("select plan, plan_until, asaas_customer from users where telegram_id=%s", (uid,))
         return cur.fetchone()
+
+def acesso_ativo(plan, until):
+    return plan == 'pro' and until is not None and until > datetime.now(pytz.utc)
 
 def alvos():
     """{ticker: [(chat_id, plano), ...]}"""
@@ -150,7 +159,8 @@ def alvos():
     out = {}
     with db() as cur:
         cur.execute("""select w.ticker, w.telegram_id, u.plan
-                       from watchlist w join users u using (telegram_id)""")
+                       from watchlist w join users u using (telegram_id)
+                       where u.plan='pro' and u.plan_until > now()""")
         for t, uid, plan in cur.fetchall():
             out.setdefault(t, []).append((uid, plan))
     return out
@@ -161,8 +171,18 @@ def checar_vencidos():
                        where plan='pro' and plan_until < now()
                        returning telegram_id""")
         vencidos = [r[0] for r in cur.fetchall()]
+        cur.execute("""update users set warned=true
+                       where plan='pro' and warned=false
+                         and plan_until > now() and plan_until < now() + interval '1 day'
+                       returning telegram_id, plan_until""")
+        avisos = cur.fetchall()
+    sp = pytz.timezone('America/Sao_Paulo')
     for uid in vencidos:
-        send_telegram('⏳ Seu plano Pro venceu. Use /planos para renovar.', uid)
+        send_telegram(f'⏳ Seu acesso terminou. Para continuar recebendo os alertas, '
+                      f'assine por R$ {PRECO:.2f}/mês:', uid, KB_ASSINAR)
+    for uid, ate in avisos:
+        send_telegram(f'⚠️ Seu acesso termina em {ate.astimezone(sp):%d/%m às %H:%M}. '
+                      f'Para não ficar sem alertas, renove por R$ {PRECO:.2f}/mês:', uid, KB_ASSINAR)
 
 def ativar_pro(pay_id, dias=30):
     """Idempotente: só ativa se o pagamento ainda estiver 'pending'."""
@@ -174,7 +194,7 @@ def ativar_pro(pay_id, dias=30):
             return None
         uid = row[0]
         cur.execute("""update users set plan='pro',
-                       plan_until = greatest(coalesce(plan_until, now()), now()) + interval '30 days'
+                       plan_until = greatest(coalesce(plan_until, now()), now()) + interval '30 days', warned=false
                        where telegram_id=%s""", (uid,))
     return uid
 
@@ -245,17 +265,17 @@ def fetch_price(ticker):
     return data
 
 # ─── Telegram (envio) ────────────────────────────────────
-def send_telegram(msg, chat_id=None):
+def send_telegram(msg, chat_id=None, markup=None):
     chat_id = chat_id or CHAT_ID
     if not TELEGRAM_TOKEN or not chat_id:
         return False
+    payload = {'chat_id': chat_id, 'text': msg, 'parse_mode': 'HTML',
+               'disable_web_page_preview': True}
+    if markup:
+        payload['reply_markup'] = markup
     try:
-        r = requests.post(
-            f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage',
-            json={'chat_id': chat_id, 'text': msg, 'parse_mode': 'HTML',
-                  'disable_web_page_preview': True},
-            timeout=10
-        )
+        r = requests.post(f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage',
+                          json=payload, timeout=10)
         ok = r.json().get('ok', False)
         print(f'[TELEGRAM] {chat_id}: {"✅ Enviado" if ok else "❌ Erro: " + str(r.json())}')
         return ok
@@ -469,16 +489,16 @@ def monitor_loop():
 bot = telebot.TeleBot(TELEGRAM_TOKEN or 'x', threaded=False)
 
 TEXTO_PLANOS = (
-    f'<b>Planos</b>\n\n'
-    f'🆓 <b>Grátis</b>: até {LIMITES["free"]} ativos, alertas de queda/alta no dia\n'
-    f'⭐ <b>Pro</b> (R$ {PRECO:.2f}/mês): até {LIMITES["pro"]} ativos, recuperação, '
-    f'volume anormal, abertura e fechamento do pregão\n\n'
+    f'<b>Como funciona</b>\n\n'
+    f'🎁 <b>{TRIAL_DIAS} dias grátis</b>, com tudo liberado, a partir do seu primeiro uso\n'
+    f'⭐ Depois, <b>R$ {PRECO:.2f}/mês</b> para continuar recebendo os alertas\n\n'
+    f'Você pode acompanhar até {LIMITE_ATIVOS} ativos (B3 e EUA).\n'
     f'<i>Os alertas são informativos e não constituem recomendação de investimento.</i>'
 )
 
 def teclado_assinar():
     kb = types.InlineKeyboardMarkup()
-    kb.add(types.InlineKeyboardButton(f'⭐ Assinar Pro (R$ {PRECO:.2f}/mês)', callback_data='assinar'))
+    kb.add(types.InlineKeyboardButton(f'⭐ Assinar (R$ {PRECO:.2f}/mês)', callback_data='assinar'))
     return kb
 
 def asaas(method, path, **kw):
@@ -494,7 +514,7 @@ def criar_pix(uid, customer_id):
     pay = asaas('POST', '/payments', json={
         'customer': customer_id, 'billingType': 'PIX', 'value': PRECO,
         'dueDate': venc, 'externalReference': str(uid),
-        'description': 'Bot Monitor - Plano Pro 30 dias'})
+        'description': 'Bot Monitor - Assinatura 30 dias'})
     qr = asaas('GET', f'/payments/{pay["id"]}/pixQrCode')
     with db() as cur:
         cur.execute("insert into payments(id, telegram_id, amount) values (%s,%s,%s)",
@@ -522,14 +542,16 @@ def iniciar_assinatura(uid, chat_id):
 
 @bot.message_handler(commands=['start', 'ajuda', 'help'])
 def cmd_start(m):
-    ensure_user(m.from_user.id)
+    ensure_user(m.from_user.id)       # no primeiro uso, já inicia o teste grátis
     bot.send_message(m.chat.id,
-        '👋 Eu monitoro ações e aviso você no Telegram.\n\n'
+        f'👋 Eu monitoro ações e aviso você no Telegram.\n\n'
+        f'🎁 Você tem <b>{TRIAL_DIAS} dias grátis</b> para testar tudo. '
+        f'Depois, R$ {PRECO:.2f}/mês.\n\n'
         '/add PETR4 — adicionar ativo\n'
         '/remove PETR4 — remover ativo\n'
         '/lista — seus ativos\n'
-        '/meuplano — seu plano\n'
-        '/planos — ver planos e assinar\n\n'
+        '/meuplano — quanto falta do seu acesso\n'
+        '/planos — como funciona e assinar\n\n'
         'Aceito ativos da B3 (ex.: PETR4, MGLU3) e dos EUA (ex.: AAPL).\n'
         '<i>Alertas informativos, não são recomendação de investimento.</i>',
         parse_mode='HTML')
@@ -549,11 +571,20 @@ def cb_assinar(c):
 
 @bot.message_handler(commands=['meuplano'])
 def cmd_meuplano(m):
-    plan, until, _ = ensure_user(m.from_user.id)
-    if plan == 'pro' and until:
-        bot.reply_to(m, f'⭐ Plano Pro até {until.astimezone(pytz.timezone("America/Sao_Paulo")):%d/%m/%Y}')
+    uid = m.from_user.id
+    plan, until, _ = ensure_user(uid)
+    if acesso_ativo(plan, until):
+        with db() as cur:
+            cur.execute("select count(*) from payments where telegram_id=%s and status='paid'", (uid,))
+            pagou = cur.fetchone()[0] > 0
+        sp = pytz.timezone('America/Sao_Paulo')
+        dias = max(0, (until - datetime.now(pytz.utc)).days)
+        tipo = 'Assinatura ativa' if pagou else 'Teste grátis'
+        bot.reply_to(m, f'✅ {tipo} até {until.astimezone(sp):%d/%m/%Y} (faltam ~{dias} dias).')
     else:
-        bot.reply_to(m, '🆓 Plano Grátis. Use /planos para conhecer o Pro.')
+        bot.send_message(m.chat.id,
+            f'Seu acesso terminou. Para continuar, assine por R$ {PRECO:.2f}/mês:',
+            reply_markup=teclado_assinar())
 
 @bot.message_handler(commands=['cpf'])
 def cmd_cpf(m):
@@ -589,7 +620,11 @@ def cmd_add(m):
     if not (is_b3(t) or re.fullmatch(r'[A-Z]{1,5}', t)):
         return bot.reply_to(m, 'Ticker inválido. Ex.: PETR4, MGLU3, AAPL.')
     uid = m.from_user.id
-    plan, _, _ = ensure_user(uid)
+    plan, until, _ = ensure_user(uid)
+    if not acesso_ativo(plan, until):
+        return bot.send_message(m.chat.id,
+            f'Seu acesso terminou. Para continuar, assine por R$ {PRECO:.2f}/mês:',
+            reply_markup=teclado_assinar())
     with db() as cur:
         cur.execute("select count(*) from watchlist where telegram_id=%s", (uid,))
         qtd = cur.fetchone()[0]
@@ -597,8 +632,8 @@ def cmd_add(m):
         ja_tem = cur.fetchone() is not None
     if ja_tem:
         return bot.reply_to(m, f'{t} já está na sua lista.')
-    if qtd >= LIMITES[plan]:
-        return bot.reply_to(m, f'Você atingiu o limite do plano {plan} ({LIMITES[plan]} ativos). /planos')
+    if qtd >= LIMITE_ATIVOS:
+        return bot.reply_to(m, f'Você atingiu o limite de {LIMITE_ATIVOS} ativos.')
     try:
         fetch_price(t)                      # confirma que o ativo existe
     except Exception:
@@ -638,15 +673,22 @@ def cmd_admin(m):
     if not eh_admin(m):
         return
     with db() as cur:
-        cur.execute("select count(*), count(*) filter (where plan='pro') from users")
-        total, pro = cur.fetchone()
+        cur.execute("""select count(*),
+                              count(*) filter (where plan='pro' and plan_until > now())
+                       from users""")
+        total, ativos_u = cur.fetchone()
+        cur.execute("select count(distinct telegram_id) from payments where status='paid'")
+        pagantes = cur.fetchone()[0]
         cur.execute("select count(*) from watchlist")
         ativos = cur.fetchone()[0]
         cur.execute("""select coalesce(sum(amount),0) from payments
                        where status='paid' and created_at >= date_trunc('month', now())""")
         mes = cur.fetchone()[0]
-    bot.reply_to(m, f'👥 Usuários: {total}\n⭐ Pro (inclui você): {pro}\n'
-                    f'📈 Ativos monitorados: {ativos}\n💰 Recebido no mês: R$ {float(mes):.2f}')
+    bot.reply_to(m, f'👥 Usuários: {total}\n'
+                    f'✅ Com acesso ativo (teste, pagos e você): {ativos_u}\n'
+                    f'💳 Já pagaram: {pagantes}\n'
+                    f'📈 Ativos monitorados: {ativos}\n'
+                    f'💰 Recebido no mês: R$ {float(mes):.2f}')
 
 @bot.message_handler(commands=['darpro'])
 def cmd_darpro(m):
@@ -659,11 +701,11 @@ def cmd_darpro(m):
     dias = int(p[2]) if len(p) > 2 and p[2].isdigit() else 30
     with db() as cur:
         cur.execute("insert into users(telegram_id) values (%s) on conflict do nothing", (uid,))
-        cur.execute("""update users set plan='pro',
+        cur.execute("""update users set plan='pro', warned=false,
                        plan_until = greatest(coalesce(plan_until, now()), now()) + %s * interval '1 day'
                        where telegram_id=%s""", (dias, uid))
-    send_telegram(f'🎁 Você ganhou {dias} dias de plano Pro!', uid)
-    bot.reply_to(m, '✅ Pro liberado.')
+    send_telegram(f'🎁 Você ganhou {dias} dias de acesso!', uid)
+    bot.reply_to(m, '✅ Acesso liberado.')
 
 @bot.message_handler(commands=['avisar'])
 def cmd_avisar(m):
@@ -718,7 +760,7 @@ def webhook_pix():
         try:
             uid = ativar_pro(pay_id) if pay_id else None
             if uid:
-                send_telegram('✅ Pagamento confirmado! Plano <b>Pro</b> ativo por 30 dias.', uid)
+                send_telegram('✅ Pagamento confirmado! Seu acesso está ativo por mais 30 dias.', uid)
         except Exception as e:
             print(f'[PIX] erro ao ativar: {e}')
             return '', 500          # Asaas tenta de novo
