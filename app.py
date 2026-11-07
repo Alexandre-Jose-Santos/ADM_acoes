@@ -23,7 +23,7 @@ TARGET_DIR      = os.environ.get('TARGET_DIR', 'below')
 DAILY_SUMMARY   = os.environ.get('DAILY_SUMMARY', 'true').lower() == 'true'
 CHECK_INTERVAL  = int(os.environ.get('CHECK_INTERVAL', '300'))
 
-MARKET_HOURS_ONLY = os.environ.get('MARKET_HOURS_ONLY', 'false').lower() == 'true'
+MARKET_HOURS_ONLY = os.environ.get('MARKET_HOURS_ONLY', 'true').lower() == 'true'
 RECOVERY_ALERT    = os.environ.get('RECOVERY_ALERT', 'false').lower() == 'true'
 RECOVERY_PCT      = float(os.environ.get('RECOVERY_PCT', '1'))
 VOLUME_ALERT      = os.environ.get('VOLUME_ALERT', 'false').lower() == 'true'
@@ -123,6 +123,8 @@ def init_db():
               created_at timestamptz default now());
         """)
         cur.execute("alter table users add column if not exists warned boolean default false")
+        cur.execute("alter table users add column if not exists alert_pct numeric")
+        cur.execute("alter table watchlist add column if not exists alert_pct numeric")
 
 def seed_owner():
     """Garante que VOCÊ é Pro (sem vencimento) e tem seus tickers do env na lista."""
@@ -155,14 +157,14 @@ def acesso_ativo(plan, until):
 def alvos():
     """{ticker: [(chat_id, plano), ...]}"""
     if not HAS_DB:
-        return {t: [(CHAT_ID, 'pro')] for t in TICKERS} if CHAT_ID else {}
+        return {t: [(CHAT_ID, 'pro', None)] for t in TICKERS} if CHAT_ID else {}
     out = {}
     with db() as cur:
-        cur.execute("""select w.ticker, w.telegram_id, u.plan
+        cur.execute("""select w.ticker, w.telegram_id, u.plan, coalesce(w.alert_pct, u.alert_pct)
                        from watchlist w join users u using (telegram_id)
                        where u.plan='pro' and u.plan_until > now()""")
-        for t, uid, plan in cur.fetchall():
-            out.setdefault(t, []).append((uid, plan))
+        for t, uid, plan, pct in cur.fetchall():
+            out.setdefault(t, []).append((uid, plan, pct))
     return out
 
 def checar_vencidos():
@@ -284,7 +286,7 @@ def send_telegram(msg, chat_id=None, markup=None):
         return False
 
 # ─── Checagem por ticker e usuário ───────────────────────
-def check_ticker(ticker, data, chat_id, plan='free'):
+def check_ticker(ticker, data, chat_id, plan='free', pct=None):
     price      = data['price']
     prev_close = data['prev_close']
     cur        = data['cur']
@@ -303,7 +305,7 @@ def check_ticker(ticker, data, chat_id, plan='free'):
     print(f'[{ticker}] {cur}{price:.2f} ({pct_day:+.2f}%) | {data["state"]} | user={chat_id}')
 
     # ── Queda/Alta acumulada no dia (todos os planos) ──
-    down_step = intraday_pct(ticker)
+    down_step = float(pct) if pct else intraday_pct(ticker)   # % do usuário, se definido
     if down_step > 0:
         level_reached = int(abs(pct_day) // down_step) if pct_day < 0 else 0
         alert_key = f'{uk}_down_{today}_{level_reached}'
@@ -319,7 +321,7 @@ def check_ticker(ticker, data, chat_id, plan='free'):
                 f'<i>⚠️ Não é recomendação de investimento.</i>'
             )
 
-    up_step = intraday_up_pct(ticker)
+    up_step = float(pct) if pct else intraday_up_pct(ticker)
     if up_step > 0:
         level_reached_up = int(pct_day // up_step) if pct_day > 0 else 0
         alert_key_up = f'{uk}_up_{today}_{level_reached_up}'
@@ -437,16 +439,14 @@ def check_ticker(ticker, data, chat_id, plan='free'):
 
 # ─── Loop principal ───────────────────────────────────────
 def is_market_hours(ticker):
+    """True só durante o pregão regular (+6 min depois do fechamento, para sair o resumo de fechamento)."""
     mkt = market_of(ticker)
     now, mins = minutes_now(mkt)
     if now.weekday() >= 5:
         return False
-    open_min = mkt['open'][0] * 60 + mkt['open'][1]
-    if is_b3(ticker):
-        close_min = mkt['close'][0] * 60 + mkt['close'][1]
-    else:
-        close_min = 20 * 60
-    return open_min <= mins <= close_min
+    open_min  = mkt['open'][0] * 60 + mkt['open'][1]
+    close_min = mkt['close'][0] * 60 + mkt['close'][1]
+    return open_min <= mins <= close_min + 6
 
 def monitor_loop():
     print(f'[MONITOR] Modo: {"MULTIUSUÁRIO (banco)" if HAS_DB else "LEGADO (só dono)"} | Intervalo: {CHECK_INTERVAL}s')
@@ -477,9 +477,9 @@ def monitor_loop():
                 print(f'[ERRO] {ticker}: {e}')
                 print(traceback.format_exc())
                 continue
-            for uid, plan in users:
+            for uid, plan, pct in users:
                 try:
-                    check_ticker(ticker, data, uid, plan)
+                    check_ticker(ticker, data, uid, plan, pct)
                 except Exception as e:
                     print(f'[ERRO] {ticker} user={uid}: {e}')
         print(f'[MONITOR] Aguardando {CHECK_INTERVAL}s...')
@@ -550,6 +550,7 @@ def cmd_start(m):
         '/add PETR4 — adicionar ativo\n'
         '/remove PETR4 — remover ativo\n'
         '/lista — seus ativos\n'
+        '/alerta PETR4 3 — definir o % de aviso\n'
         '/meuplano — quanto falta do seu acesso\n'
         '/planos — como funciona e assinar\n\n'
         'Aceito ativos da B3 (ex.: PETR4, MGLU3) e dos EUA (ex.: AAPL).\n'
@@ -655,10 +656,62 @@ def cmd_remove(m):
 
 @bot.message_handler(commands=['lista'])
 def cmd_lista(m):
+    uid = m.from_user.id
     with db() as cur:
-        cur.execute("select ticker from watchlist where telegram_id=%s order by ticker", (m.from_user.id,))
-        ts = [r[0] for r in cur.fetchall()]
-    bot.reply_to(m, ', '.join(ts) if ts else 'Lista vazia. Use /add PETR4')
+        cur.execute("select ticker, alert_pct from watchlist where telegram_id=%s order by ticker", (uid,))
+        linhas = cur.fetchall()
+        cur.execute("select alert_pct from users where telegram_id=%s", (uid,))
+        row = cur.fetchone()
+    padrao = row[0] if row else None
+    if not linhas:
+        return bot.reply_to(m, 'Lista vazia. Use /add PETR4')
+    itens = [f'{t} ({float(p):g}%)' if p else t for t, p in linhas]
+    txt = ', '.join(itens)
+    if padrao:
+        txt += f'\n\nPadrão: aviso a cada {float(padrao):g}%'
+    bot.reply_to(m, txt)
+
+@bot.message_handler(commands=['alerta'])
+def cmd_alerta(m):
+    uid = m.from_user.id
+    ensure_user(uid)
+    args = m.text.split()[1:]
+    uso = ('Use:\n'
+           '/alerta 3 — aviso a cada 3% para todos os seus ativos\n'
+           '/alerta PETR4 3 — só para PETR4\n'
+           '/alerta PETR4 padrao — PETR4 volta ao padrão\n\n'
+           'O aviso sai a cada X% de queda ou alta no dia. Mínimo 0,5%.')
+
+    def num(s):
+        try:
+            v = float(s.replace(',', '.'))
+        except ValueError:
+            return None
+        return v if 0.5 <= v <= 50 else None
+
+    if not args:
+        return bot.reply_to(m, uso)
+    if len(args) == 1:
+        v = num(args[0])
+        if v is None:
+            return bot.reply_to(m, uso)
+        with db() as cur:
+            cur.execute("update users set alert_pct=%s where telegram_id=%s", (v, uid))
+        return bot.reply_to(m, f'✅ Aviso a cada {v:g}% de queda ou alta. '
+                               f'Ativos com valor próprio mantêm o deles.')
+    t = args[0].upper()
+    with db() as cur:
+        cur.execute("select 1 from watchlist where telegram_id=%s and ticker=%s", (uid, t))
+        if cur.fetchone() is None:
+            return bot.reply_to(m, f'{t} não está na sua lista. Use /add {t} primeiro.')
+        if args[1].lower() in ('padrao', 'padrão'):
+            cur.execute("update watchlist set alert_pct=null where telegram_id=%s and ticker=%s", (uid, t))
+            return bot.reply_to(m, f'✅ {t} voltou ao padrão.')
+        v = num(args[1])
+        if v is None:
+            return bot.reply_to(m, uso)
+        cur.execute("update watchlist set alert_pct=%s where telegram_id=%s and ticker=%s", (v, uid, t))
+    bot.reply_to(m, f'✅ {t}: aviso a cada {v:g}% de queda ou alta.')
 
 # ─── Comandos de administrador ───────────────────────────
 def eh_admin(m):
