@@ -17,16 +17,16 @@ TELEGRAM_TOKEN  = os.environ.get('TELEGRAM_TOKEN', '')
 CHAT_ID         = os.environ.get('CHAT_ID', '')          # seu chat (dono do bot)
 TICKERS         = [t.strip() for t in os.environ.get('TICKERS', 'ARR').upper().split(',') if t.strip()]
 INTRADAY_PCT    = float(os.environ.get('INTRADAY_PCT', '1'))
-INTRADAY_UP_PCT = float(os.environ.get('INTRADAY_UP_PCT', '0'))
+INTRADAY_UP_PCT = float(os.environ.get('INTRADAY_UP_PCT') or INTRADAY_PCT)   # sem valor próprio, usa o mesmo % da queda
 TARGET_PRICE    = float(os.environ.get('TARGET_PRICE', '0'))   # só vale para o dono
 TARGET_DIR      = os.environ.get('TARGET_DIR', 'below')
-DAILY_SUMMARY   = os.environ.get('DAILY_SUMMARY', 'true').lower() == 'true'
+DAILY_SUMMARY   = False   # desligado no código: sem resumo de abertura/fechamento
 CHECK_INTERVAL  = int(os.environ.get('CHECK_INTERVAL', '300'))
 
 MARKET_HOURS_ONLY = os.environ.get('MARKET_HOURS_ONLY', 'true').lower() == 'true'
-RECOVERY_ALERT    = os.environ.get('RECOVERY_ALERT', 'false').lower() == 'true'
+RECOVERY_ALERT    = False   # desligado no código: sem alerta de recuperação
 RECOVERY_PCT      = float(os.environ.get('RECOVERY_PCT', '1'))
-VOLUME_ALERT      = os.environ.get('VOLUME_ALERT', 'false').lower() == 'true'
+VOLUME_ALERT      = False   # desligado no código: sem alerta de volume
 VOLUME_MULTIPLIER = float(os.environ.get('VOLUME_MULTIPLIER', '2'))
 
 # ─── Assinatura / banco / pagamento ──────────────────────
@@ -41,6 +41,14 @@ PRECO         = float(os.environ.get('ASSINATURA_PRECO', '50.00'))
 TRIAL_DIAS    = int(os.environ.get('TRIAL_DIAS', '7'))          # dias de teste grátis
 LIMITE_ATIVOS = int(os.environ.get('LIMITE_ATIVOS', '10'))        # limite de quem assina
 LIMITE_TESTE  = int(os.environ.get('LIMITE_TESTE', '2'))          # limite durante o teste grátis
+
+EUA_PUBLICO   = os.environ.get('EUA_PUBLICO', 'false').lower() == 'true'   # false = ações dos EUA só para o dono
+MERCADOS_TXT  = 'B3 e EUA' if EUA_PUBLICO else 'B3'
+ACEITO_TXT    = ('Aceito ações da B3 (ex.: PETR4, VALE3, MGLU3, ITUB4) e dos EUA (ex.: AAPL).' if EUA_PUBLICO
+                 else 'Aceito ações da B3 (ex.: PETR4, VALE3, MGLU3, ITUB4).')
+
+def eh_dono(uid):
+    return bool(CHAT_ID) and str(uid) == str(CHAT_ID)
 
 def brl(v):
     """50 -> '50,00' (formato brasileiro)"""
@@ -171,7 +179,8 @@ def alvos():
                        from watchlist w join users u using (telegram_id)
                        where u.plan='pro' and u.plan_until > now()""")
         for t, uid, plan, pct in cur.fetchall():
-            out.setdefault(t, []).append((uid, plan, pct))
+            if is_b3(t) or EUA_PUBLICO or eh_dono(uid):     # EUA: só o dono (uso interno)
+                out.setdefault(t, []).append((uid, plan, pct))
     return out
 
 def checar_vencidos():
@@ -498,7 +507,7 @@ bot = telebot.TeleBot(TELEGRAM_TOKEN or 'x', threaded=False)
 TEXTO_PLANOS = (
     f'<b>Como funciona</b>\n\n'
     f'🎁 <b>{TRIAL_DIAS} dias grátis</b> para testar, com até {LIMITE_TESTE} ações\n'
-    f'⭐ Depois, <b>R$ {brl(PRECO)}/mês</b> para continuar, com até {LIMITE_ATIVOS} ações (B3 e EUA)\n\n'
+    f'⭐ Depois, <b>R$ {brl(PRECO)}/mês</b> para continuar, com até {LIMITE_ATIVOS} ações ({MERCADOS_TXT})\n\n'
     f'<i>Os alertas são informativos e não constituem recomendação de investimento.</i>'
 )
 
@@ -559,7 +568,7 @@ def cmd_start(m):
         '/alerta PETR4 3 — definir o % de aviso\n'
         '/meuplano — quanto falta do seu acesso\n'
         '/planos — como funciona e assinar\n\n'
-        'Aceito ativos da B3 (ex.: PETR4, MGLU3) e dos EUA (ex.: AAPL).\n'
+        f'{ACEITO_TXT}\n'
         '<i>Alertas informativos, não são recomendação de investimento.</i>',
         parse_mode='HTML')
 
@@ -625,7 +634,9 @@ def cmd_add(m):
         return bot.reply_to(m, 'Use: /add PETR4')
     t = p[1].upper()
     if not (is_b3(t) or re.fullmatch(r'[A-Z]{1,5}', t)):
-        return bot.reply_to(m, 'Ticker inválido. Ex.: PETR4, MGLU3, AAPL.')
+        return bot.reply_to(m, 'Ticker inválido. Ex.: PETR4, MGLU3, VALE3.')
+    if not is_b3(t) and not EUA_PUBLICO and not eh_dono(m.from_user.id):
+        return bot.reply_to(m, 'Por enquanto monitoro só ações da B3 (ex.: PETR4, VALE3, MGLU3, ITUB4).')
     uid = m.from_user.id
     plan, until, _ = ensure_user(uid)
     if not acesso_ativo(plan, until):
