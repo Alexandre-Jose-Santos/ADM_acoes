@@ -243,44 +243,145 @@ def fetch_price_twelve(ticker):
         'avg_volume': float(data.get('average_volume', 0)),
     }
 
-def fetch_price_brapi(ticker):
-    headers = {'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json'}
-    if BRAPI_TOKEN:
-        headers['Authorization'] = f'Bearer {BRAPI_TOKEN}'
-    url = f'https://brapi.dev/api/quote/{ticker}'
-    print(f'[BRAPI] GET quote {ticker}', flush=True)
-    try:
-        r = requests.get(url, headers=headers, timeout=(5, 10))
-        print(f'[BRAPI] Status HTTP: {r.status_code}', flush=True)
-    except Exception as e:
-        print(f'[BRAPI] EXCEPTION na requisição: {type(e).__name__}: {e}', flush=True)
-        raise
-    data = r.json()
-    results = data.get('results') or []
-    if r.status_code != 200 or not results:
-        raise Exception(f'Sem dados para {ticker} (HTTP {r.status_code}): {data}')
+# ─── brapi.dev (API v2): cotação em lote ─────────────────
+# Rota: GET /api/v2/stocks/quote?symbols=PETR4,VALE3   (header Authorization: Bearer <BRAPI_TOKEN>)
+BRAPI_URL         = 'https://brapi.dev/api/v2/stocks/quote'
+BRAPI_MAX_SYMBOLS = max(1, int(os.environ.get('BRAPI_MAX_SYMBOLS', '1')))   # tickers por chamada: depende do plano (grátis = 1)
+BRAPI_ESPERA_MAX  = 120          # espera no máximo 120 s por um Retry-After no monitor
+_brapi_pausa_ate  = 0.0          # enquanto houver limite (429), não chama a API
 
-    q = results[0]
-    price = float(q['regularMarketPrice'])
+class BrapiError(Exception):
+    def __init__(self, msg, status=None, retry_after=None):
+        super().__init__(msg)
+        self.status = status
+        self.retry_after = retry_after
+
+def _num(v, default=None):
+    """float seguro: trata null e texto inválido."""
+    try:
+        return float(v) if v is not None else default
+    except (TypeError, ValueError):
+        return default
+
+def _brapi_get(symbols):
+    """Uma chamada à brapi. Devolve o JSON ou levanta BrapiError (401, 404, 429, ...)."""
+    global _brapi_pausa_ate
+    falta = _brapi_pausa_ate - time.time()
+    if falta > 0:
+        raise BrapiError(f'em espera por limite (429): {int(falta)}s', 429, int(falta) + 1)
+    headers = {'Accept': 'application/json'}
+    if BRAPI_TOKEN:
+        headers['Authorization'] = f'Bearer {BRAPI_TOKEN}'       # a chave nunca vai para o código nem para a URL
+    print(f'[BRAPI] GET quote {",".join(symbols)}', flush=True)
+    try:
+        r = requests.get(BRAPI_URL, params={'symbols': ','.join(symbols)}, headers=headers, timeout=(5, 15))
+    except requests.RequestException as e:
+        raise BrapiError(f'falha de rede: {type(e).__name__}') from e
+    print(f'[BRAPI] HTTP {r.status_code}', flush=True)
+    if r.status_code == 200:
+        try:
+            return r.json()
+        except ValueError:
+            raise BrapiError('resposta inválida (não é JSON)', 200)
+    if r.status_code == 401:
+        raise BrapiError('token ausente ou inválido (401): confira o BRAPI_TOKEN', 401)
+    if r.status_code == 404:
+        raise BrapiError('nenhum dado para os tickers pedidos (404)', 404)
+    if r.status_code == 429:
+        try:
+            espera = max(1, int(float(r.headers.get('Retry-After', '60'))))
+        except ValueError:
+            espera = 60
+        _brapi_pausa_ate = time.time() + espera
+        raise BrapiError(f'limite de requisições (429): tentar em {espera}s', 429, espera)
+    detalhe = ''
+    try:
+        detalhe = str((r.json() or {}).get('message', ''))[:120]
+    except ValueError:
+        pass
+    raise BrapiError(f'HTTP {r.status_code} {detalhe}'.strip(), r.status_code)
+
+def _brapi_snapshot(ticker, q):
+    """Converte StockQuoteSnapshot (v2) no formato interno. None se não houver preço (null)."""
+    price = _num(q.get('regularMarketPrice'))
+    if price is None:
+        return None
     return {
         'ticker':     ticker,
         'name':       q.get('shortName') or q.get('longName') or ticker,
         'price':      price,
-        'open':       float(q.get('regularMarketOpen') or price),
-        'prev_close': float(q.get('regularMarketPreviousClose') or price),
-        'day_high':   float(q.get('regularMarketDayHigh') or price),
-        'day_low':    float(q.get('regularMarketDayLow') or price),
-        'volume':     float(q.get('regularMarketVolume') or 0),
-        'avg_volume': float(q.get('averageDailyVolume3Month') or 0),
+        'open':       _num(q.get('regularMarketOpen'), price),
+        'prev_close': _num(q.get('regularMarketPreviousClose'), price),
+        'day_high':   _num(q.get('regularMarketDayHigh'), price),
+        'day_low':    _num(q.get('regularMarketDayLow'), price),
+        'volume':     _num(q.get('regularMarketVolume'), 0.0),
+        'avg_volume': 0.0,       # a cotação v2 não traz volume médio (o alerta de volume está desligado)
     }
 
-def fetch_price(ticker):
+def _brapi_lote(lote, esperar):
+    try:
+        dados = _brapi_get(lote)
+    except BrapiError as e:
+        # 429: no monitor, respeita o Retry-After uma vez; no /add, não trava o usuário
+        if e.status == 429 and esperar and (e.retry_after or 0) <= BRAPI_ESPERA_MAX:
+            print(f'[BRAPI] aguardando Retry-After de {e.retry_after}s', flush=True)
+            time.sleep(e.retry_after)
+            dados = _brapi_get(lote)
+        else:
+            raise
+    out = {}
+    for item in (dados or {}).get('results') or []:
+        pedido = str(item.get('requestedSymbol') or item.get('symbol') or '').upper()
+        snap = _brapi_snapshot(pedido, item.get('data') or {})
+        if pedido and snap:
+            out[pedido] = snap
+        else:
+            print(f'[BRAPI] {pedido or "?"}: sem preço na resposta (null)', flush=True)
+    return out
+
+def fetch_prices_brapi(tickers, esperar=False):
+    """Cotações da B3 em lote (symbols). Retorna ({ticker: dados}, {ticker: erro})."""
+    global BRAPI_MAX_SYMBOLS
+    tickers = list(dict.fromkeys(t.upper() for t in tickers))
+    ok, falhas = {}, {}
+    i = 0
+    while i < len(tickers):
+        lote = tickers[i:i + BRAPI_MAX_SYMBOLS]
+        i += len(lote)
+        try:
+            ok.update(_brapi_lote(lote, esperar))
+        except BrapiError as e:
+            if e.status in (400, 403) and len(lote) > 1:
+                # o plano não aceita tantos tickers por chamada: passa a consultar um por vez
+                print('[BRAPI] plano não aceita lote; usando 1 ticker por chamada', flush=True)
+                BRAPI_MAX_SYMBOLS = 1
+                i -= len(lote)
+                continue
+            for t in lote:
+                falhas[t] = e
+            if e.status in (401, 429):             # não adianta insistir nos próximos lotes
+                for t in tickers[i:]:
+                    falhas[t] = e
+                break
+        for t in lote:
+            if t not in ok and t not in falhas:
+                falhas[t] = BrapiError('sem dados para este ticker', 404)
+    return ok, falhas
+
+def _decorar(data, ticker):
     mkt = market_of(ticker)
-    data = fetch_price_brapi(ticker) if is_b3(ticker) else fetch_price_twelve(ticker)
     data['state'] = session_state(mkt)
     data['cur']   = mkt['cur']
     data['mkt']   = mkt
     return data
+
+def fetch_price(ticker):
+    if is_b3(ticker):
+        ok, falhas = fetch_prices_brapi([ticker])
+        if ticker not in ok:
+            raise falhas.get(ticker) or BrapiError('sem dados', 404)
+        return _decorar(ok[ticker], ticker)
+    return _decorar(fetch_price_twelve(ticker), ticker)
 
 # ─── Telegram (envio) ────────────────────────────────────
 def send_telegram(msg, chat_id=None, markup=None):
@@ -466,7 +567,7 @@ def is_market_hours(ticker):
 
 def monitor_loop():
     print(f'[MONITOR] Modo: {"MULTIUSUÁRIO (banco)" if HAS_DB else "LEGADO (só dono)"} | Intervalo: {CHECK_INTERVAL}s')
-    print(f'[MONITOR] TWELVE_KEY: {"SIM" if TWELVE_KEY else "NAO"} | BRAPI_TOKEN: {"SIM" if BRAPI_TOKEN else "NAO (modo teste)"}')
+    print(f'[MONITOR] TWELVE_KEY: {"SIM" if TWELVE_KEY else "NAO"} | BRAPI_TOKEN: {"SIM" if BRAPI_TOKEN else "NAO (só PETR4, VALE3, MGLU3 e ITUB4)"}')
     print(f'[MONITOR] Silêncio fora do pregão: {"ATIVO" if MARKET_HOURS_ONLY else "INATIVO"} | '
           f'Recuperação: {"ATIVO" if RECOVERY_ALERT else "INATIVO"} | Volume: {"ATIVO" if VOLUME_ALERT else "INATIVO"}')
     while True:
@@ -482,12 +583,26 @@ def monitor_loop():
             print(f'[ERRO] alvos: {e}')
             mapa = {}
 
+        ativos = {}
         for ticker, users in mapa.items():
             if MARKET_HOURS_ONLY and not is_market_hours(ticker):
                 print(f'[MONITOR] {ticker}: fora do horário de pregão — pulando')
                 continue
+            ativos[ticker] = users
+
+        b3 = [t for t in ativos if is_b3(t)]
+        cot_b3, falhas_b3 = fetch_prices_brapi(b3, esperar=True) if b3 else ({}, {})
+        for t, err in falhas_b3.items():
+            print(f'[ERRO] {t}: {err}')
+
+        for ticker, users in ativos.items():
             try:
-                data = fetch_price(ticker)       # 1 chamada de API por ticker
+                if is_b3(ticker):
+                    if ticker not in cot_b3:
+                        continue
+                    data = _decorar(dict(cot_b3[ticker]), ticker)
+                else:
+                    data = fetch_price(ticker)       # EUA: Twelve Data, 1 chamada por ticker
             except Exception as e:
                 import traceback
                 print(f'[ERRO] {ticker}: {e}')
@@ -662,6 +777,13 @@ def cmd_add(m):
             reply_markup=teclado_assinar())
     try:
         fetch_price(t)                      # confirma que o ativo existe
+    except BrapiError as e:
+        print(f'[BRAPI] /add {t}: {e}')
+        if e.status == 429:
+            return bot.reply_to(m, 'O serviço de cotações está com limite de consultas agora. Tente de novo em alguns minutos.')
+        if e.status in (401, 403):
+            return bot.reply_to(m, 'O serviço de cotações está indisponível no momento. Tente mais tarde.')
+        return bot.reply_to(m, f'Não encontrei dados para {t}. Confira o código.')
     except Exception:
         return bot.reply_to(m, f'Não encontrei dados para {t}. Confira o código.')
     with db() as cur:
@@ -802,6 +924,23 @@ def cmd_avisar(m):
             enviados += 1
         time.sleep(0.05)
     bot.reply_to(m, f'Enviado para {enviados} de {len(ids)}.')
+
+@bot.message_handler(commands=['brapi'])
+def cmd_brapi(m):
+    """Teste da integração com a brapi (só o dono). Ex.: /brapi PETR4 VALE3"""
+    if not eh_dono(m.from_user.id):
+        return
+    tickers = [t.upper() for t in m.text.split()[1:]] or ['PETR4', 'VALE3']
+    ok, falhas = fetch_prices_brapi(tickers)
+    linhas = [f'brapi v2 | token: {"sim" if BRAPI_TOKEN else "não"} | tickers por chamada: {BRAPI_MAX_SYMBOLS}']
+    for t in tickers:
+        d = ok.get(t)
+        if d:
+            pct = (d['price'] - d['prev_close']) / d['prev_close'] * 100 if d['prev_close'] else 0
+            linhas.append(f"{t}: {d['name']} | R$ {brl(d['price'])} | ant. {brl(d['prev_close'])} | {pct:+.2f}%")
+        else:
+            linhas.append(f'{t}: erro: {falhas.get(t)}')
+    bot.reply_to(m, '\n'.join(linhas))
 
 # ─── Flask (keepalive, status, webhooks) ─────────────────
 @app.route('/')
